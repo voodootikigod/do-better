@@ -1,0 +1,14 @@
+{
+  "name": "do-better",
+  "version": "0.1.0",
+  "description": "Brownfield codebase analysis → verified findings → technical roadmap. The brownfield front-end to the ADLC.",
+  "type": "module",
+  "bin": { "do-better": "bin/cli.js", "dobetter": "bin/cli.js" },
+  "files": ["bin/", "src/", "do-better/"],
+  "engines": { "node": ">=18.0.0" },
+  "scripts": { "test": "node --test" },
+  "keywords": ["brownfield", "codebase-analysis", "roadmap", "characterization-tests", "adlc"],
+  "author": "Chris Williams (@voodootikigod)",
+  "license": "MIT",
+  "homepage": "https://github.com/voodootikigod/do-better"
+}

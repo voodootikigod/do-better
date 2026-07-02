@@ -1,0 +1,13 @@
+[
+  "The deploy pipeline breaks weekly and nobody trusts the test suite",
+  "stabilize",
+  "Must stay on Node >= 18; two-person team; no new services",
+  "4",
+  "5",
+  "3",
+  "2",
+  "3",
+  "5",
+  "3",
+  "2"
+]

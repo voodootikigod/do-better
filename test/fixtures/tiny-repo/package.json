@@ -1,0 +1,17 @@
+{
+  "name": "tiny-app",
+  "version": "1.0.0",
+  "description": "Tiny fixture app for do-better tests",
+  "type": "module",
+  "bin": { "tiny-tool": "bin/tool.js" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
