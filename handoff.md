@@ -276,7 +276,27 @@ that trap.
 #### Acceptance criteria
 - AC1: `node --test test/identify-rails.test.js` green against current `main` *before* any T1 code lands. *(Verification: run on main.)*
 - AC2: No existing test file modified. *(Verification: `git diff --stat main -- test/` shows only the new file.)*
-- AC3: Rails survive mutation — `adlc hollow-test --test-cmd "node --test test/identify-rails.test.js" --base main` exits 0 (no surviving mutants; a rail that `toBeDefined()`s its way to green is not a rail). *(Mechanical gate, §2b.)*
+- AC3: Rails are non-vacuous. **Correction from execution**: `adlc hollow-test`
+  cannot validate this — it unconditionally excludes test/spec files from its
+  mutation targets (`EXCLUDE_PATH_RE = /(?:test|spec)/i` in
+  `@adlc/hollow-test/lib/targets.mjs`) and is strictly diff-scoped with no
+  explicit-target flag; T0's diff is test-only (rails precede any source
+  change), so it always reports `0 mutants, exit 0` regardless of rail
+  quality — that result is not evidence of anything. Use a **manual
+  regression-injection spot-check** instead (do-better's own doctrine already
+  names this class of fallback — "hollow-test → deletion spot-check"): for
+  each pin, temporarily break the corresponding behavior in
+  `src/identify.js`, confirm the pinned rail goes red, then revert
+  (`git diff --stat src/identify.js` empty afterward). Spot-checking pin 1
+  this way on the first draft found a real gap — the original assertion
+  could not distinguish "comprehend gate check fired" from "the very next
+  guard (missing `charter.md`) fired instead," both raising an
+  indistinguishable `OpError`/`exitCode:1` under the non-pin rule — fixed by
+  isolating the one precondition via `writeComprehensionInputs`. Spot-check
+  at least the pin most structurally similar to a known-fragile one (here:
+  any pin asserting a thrown-error *category* rather than a positive,
+  fixture-forced behavior) before treating the rail as frozen.
+  *(Manual mechanical check, documented in the commit message.)*
 
 **Depends on**: nothing. **Effort**: M. **Builder tier**: mid.
 **Partition**: `test/identify-rails.test.js` only.
