@@ -33,6 +33,21 @@ const REPRO_SYSTEM =
   'or a native grep as {"grep":{"pattern":"<regex>","file":"<relative path>"}}. ' +
   'If no deterministic check exists, return {"reproCmd":null}. Respond with JSON only.';
 
+// The five finder lenses (T2 pooled parallax). IDs are fixed doctrine; the
+// paragraph text lives in refute-charter.md's "## Lenses" section and is loaded
+// via parseLenses(). The hardcoded fallback below preserves diversity when that
+// section is absent or unparseable — degraded loudly, never silently.
+const LENS_IDS = Object.freeze([
+  "exploit-author", "oncall-3am", "new-hire-reader", "performance-profiler", "staff-skeptic",
+]);
+const FALLBACK_LENSES = Object.freeze([
+  { id: "exploit-author", text: "Read as an attacker: trace every path from an untrusted boundary to a dangerous sink (shell, query, template, deserializer, file path, outbound request). Cite the line where attacker-controlled data reaches the call and the input that turns it hostile." },
+  { id: "oncall-3am", text: "Read as the engineer the pager just woke: hunt for what fails silently or un-diagnosably — swallowed errors, missing timeouts, retries that mask the cause, states with no breadcrumb. Cite the line where a real failure produces no signal or the wrong one." },
+  { id: "new-hire-reader", text: "Read as someone here on day one, trusting names and comments: hunt for anything that builds a wrong mental model — misleading names, comments that contradict the code, magic constants, implicit coupling. Cite the line a careful reader would misunderstand and the mistake it invites." },
+  { id: "performance-profiler", text: "Read with a flamegraph in mind: hunt for cost hidden in innocent code — a query inside a loop, a quadratic scan, blocking I/O on a hot path, unbounded growth on untrusted input. Cite the line whose cost is super-linear in something a caller controls and the scale that stalls it." },
+  { id: "staff-skeptic", text: "Read as a staff engineer in design review: look past the line to the decision it encodes and how it ages — eroding layer boundaries, unenforced invariants, two sources of truth, load-bearing 'temporary' shapes. Cite where intent and implementation diverge and the change that would break it." },
+]);
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -40,6 +55,66 @@ export function dedupeKey(candidate) {
   const claim = String(candidate?.claim ?? candidate?.title ?? "")
     .toLowerCase().replace(/\s+/g, " ").trim();
   return sha256Hex(`${candidate?.dimension ?? ""}|${candidate?.file ?? ""}|${claim}`);
+}
+
+// Split the refute-charter doc into the finder base prompt (everything ABOVE
+// "## Lenses" — this is what every finder sees, replacing the pre-T2 whole-file
+// load) and the parsed lens catalog. Fallback (section absent or not the
+// expected 5 lenses): base = the whole doc (pre-T2 behavior preserved) and the
+// hardcoded catalog is used — a declared degradation, logged loudly via
+// log.warn so a malformed reference never silently collapses lens diversity.
+export function parseLenses(refuteDoc, log) {
+  const doc = String(refuteDoc ?? "");
+  const headingRx = /^##\s+Lenses\s*$/m;
+  const m = headingRx.exec(doc);
+  if (m) {
+    const base = doc.slice(0, m.index).replace(/\s+$/, "");
+    const section = doc.slice(m.index + m[0].length);
+    const lenses = [];
+    const lensRx = /^###\s+(.+?)\s*$/gm;
+    let lm;
+    const marks = [];
+    while ((lm = lensRx.exec(section)) !== null) marks.push({ id: lm[1].trim(), start: lensRx.lastIndex });
+    for (let i = 0; i < marks.length; i++) {
+      const end = i + 1 < marks.length
+        ? section.lastIndexOf("###", marks[i + 1].start)
+        : section.length;
+      const text = section.slice(marks[i].start, end === -1 ? section.length : end).trim();
+      if (marks[i].id && text) lenses.push({ id: marks[i].id, text });
+    }
+    const ids = lenses.map((l) => l.id);
+    const wellFormed = lenses.length === LENS_IDS.length && LENS_IDS.every((id) => ids.includes(id));
+    if (wellFormed) return { base, lenses };
+  }
+  log?.warn?.(
+    'refute-charter.md: "## Lenses" section absent or unparseable — falling back to the ' +
+    `${FALLBACK_LENSES.length} hardcoded finder lenses (declared degradation; lens diversity preserved).`,
+  );
+  return { base: doc.replace(/\s+$/, ""), lenses: FALLBACK_LENSES.map((l) => ({ ...l })) };
+}
+
+// The MAXIMUM pool width from the --n flag. When --n is unset the ceiling is 1
+// (pooling is opt-in): a no-flag `audit` keeps the pre-T2 single-finder call
+// count per pass, which the frozen identify.test.js "MAX_PASSES cap" rail pins
+// exactly (a weight-5 dimension at width>1 would go dry early and never hit the
+// cap). Lens ROTATION across passes is still active at width 1; only the
+// within-pass FAN-OUT needs --n>1. --n N raises the ceiling to N.
+function charterPoolMax(n) {
+  return Number.isInteger(n) && n >= 1 ? n : 1;
+}
+
+// Charter-weighted finder pool width (T2). `n` is the --n ceiling (the MAXIMUM
+// pool width). A high-weight dimension gets the full width; mid-weight gets
+// half (floored, min 1); weight 1 gets a single finder — no pooling, identical
+// to the pre-T2 single-call behavior for that dimension.
+export function charterPoolWidth(weight, n) {
+  const cap = Number.isInteger(n) && n >= 1 ? n : 1;
+  const w = Number(weight);
+  let width;
+  if (w >= 4) width = cap;
+  else if (w >= 2) width = Math.max(1, Math.floor(cap / 2));
+  else width = 1;
+  return Math.min(cap, Math.max(1, width));
 }
 
 function patchPhase(state, phase, patch) {
@@ -505,13 +580,18 @@ function writeD2Coverage(dotdir, data) {
 // One (dimension × packet) cell: loop-until-dry (K_DRY consecutive zero-new
 // passes, MAX_PASSES cap). priorConclusions is pool-wide per dimension — a
 // candidate already found via another packet is never re-proposed here.
-async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, refuteSystem, taxonomyDoc }) {
+async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, lenses, poolWidth, taxonomyDoc }) {
   const { llm, log } = ctx;
   const newCands = [];
   let dryStreak = 0;
   let pass = 0;
   while (pass < MAX_PASSES && dryStreak < K_DRY) {
+    const passIndex = pass;
     pass += 1;
+    // One shared context per pass (prior conclusions + packet); the N pooled
+    // calls differ ONLY by their assigned lens. Candidates from all N are
+    // validated and deduped together — the pass's newCount is the POOLED total,
+    // and the dry streak advances only when the whole pool yields zero new.
     const priorList = priorFixed.concat(pool.map((c) => ({ title: c.title, file: c.file })));
     const priorTxt = priorList.length
       ? priorList.map((c) => `- ${c.title} (${c.file})`).join("\n")
@@ -522,18 +602,26 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, refute
       `Conclusions of prior passes — do NOT repeat these; find NEW evidence or return an empty list:\n${priorTxt}\n\n` +
       `Code under review:\n${packetText}\n\n` +
       'Return JSON {"candidates":[{"title":"...","claim":"...","file":"src/x.js","line":12,"severity":"critical|high|medium|low","confidence":0.8}]} — empty array if nothing new.';
-    const obj = await jsonCall(llm, { prompt, system: refuteSystem, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
-    const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
     let newCount = 0;
-    for (const r of raw) {
-      const cand = validateCandidate(r, dim.id, log);
-      if (!cand) continue;
-      const key = dedupeKey(cand);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      pool.push(cand);
-      newCands.push(cand);
-      newCount += 1;
+    for (let i = 0; i < poolWidth; i++) {
+      const lens = lenses[(passIndex + i) % lenses.length];
+      const system = `${base}\n\nLens: ${lens.text}`;
+      // A BudgetError from any pooled call rethrows immediately (stop-the-world,
+      // matching the single-finder contract); any other error, after the LLM
+      // layer's own retries, propagates and fails the phase (fail closed — a
+      // silently absent pool member would be undeclared coverage loss).
+      const obj = await jsonCall(llm, { prompt, system, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
+      const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
+      for (const r of raw) {
+        const cand = validateCandidate(r, dim.id, log);
+        if (!cand) continue;
+        const key = dedupeKey(cand);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pool.push(cand);
+        newCands.push(cand);
+        newCount += 1;
+      }
     }
     dryStreak = newCount === 0 ? dryStreak + 1 : 0;
   }
@@ -545,6 +633,7 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, refute
 // ---------------------------------------------------------------------------
 export async function run(ctx) {
   const { root, dotdir, llm, log, exec } = ctx;
+  const flags = ctx.flags ?? {};
   const now = ctx.now;
   let state = ctx.state;
   try {
@@ -558,7 +647,8 @@ export async function run(ctx) {
     const offline = llm.offline === true;
 
     const dims = orderedDimensions(charterArt.meta ?? {});
-    const refuteSystem = loadRef("refute-charter.md", FALLBACK_REFUTE);
+    const { base: refuteBase, lenses } = parseLenses(loadRef("refute-charter.md", FALLBACK_REFUTE), log);
+    const poolMax = charterPoolMax(flags.n);
     const taxonomyDoc = loadRef("taxonomy.md", "");
     const declaredFiles = deepReadFileList(dotdir, state);
     const slices = loadSlices(root, declaredFiles);
@@ -657,6 +747,7 @@ export async function run(ctx) {
       const pool = [];
       const priorFixed = priorByDim[dim.id] ?? [];
       const priorDryForDim = priorDry[dim.id] ?? [];
+      const poolWidth = charterPoolWidth(dim.weight, poolMax);
       const dryCells = [];
       let totalPasses = 0;
       for (let pi = 0; pi < packets.length; pi++) {
@@ -665,7 +756,7 @@ export async function run(ctx) {
           continue;
         }
         const cell = await finderCell(ctx, {
-          dim, packetText: packets[pi].packet, pool, priorFixed, seen, refuteSystem, taxonomyDoc,
+          dim, packetText: packets[pi].packet, pool, priorFixed, seen, base: refuteBase, lenses, poolWidth, taxonomyDoc,
         });
         totalPasses += cell.passes;
         if (cell.dry) dryCells.push(pi);

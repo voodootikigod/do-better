@@ -97,10 +97,24 @@ npx do-better refresh     # idempotent re-run; diffs vs pinned SHA; only changed
 | `--model-cheap <id>` / `--model-mid <id>` / `--model-frontier <id>` | all | Override the model for one tier (see Model tiering). |
 | `--target <dir>` | all | Target repo (also the second positional). Default `.`. |
 | `--approve` | `charter`, `roadmap` | Approve the human-gated artifact as it stands on disk (post-edit hashes are recorded, not rejected). |
-| `--n <N>` / `--threshold <t>` | `audit` | Parallax fan width (default 3) / divergence threshold (default 0.25). |
+| `--n <N>` / `--threshold <t>` | `audit` | D1 parallax fan width (default 3) **and** the D2 finder-pool ceiling / divergence threshold (default 0.25). In D2, `--n` caps a charter-weighted pool of distinct-lens finders (table below); unset, the D2 pool ceiling is 1 (pooling opt-in). |
 | `--yes` | `rail`, others | Skip confirmations (e.g. the rails commit). Never skips the two human gates. |
 | `--json` | all | Machine-readable summary on stdout. |
 | `-h`, `--help` | all | Help. |
+
+**D2 charter-weighted finder-pool width.** `--n` is the ceiling; each pass fans
+that many finders, each under a distinct lens, so "dry" means the codebase is
+exhausted rather than that a single context converged:
+
+| Charter weight | Effective pool width |
+|---|---|
+| 4–5 | `--n` (full width) |
+| 2–3 | `max(1, floor(--n / 2))` |
+| 1 | `1` (no pooling) |
+
+`--n 1` reproduces the pre-pool single-finder call counts exactly (every
+dimension is width 1). Unset, the D2 ceiling is 1; lens rotation across passes
+is always on, while the within-pass fan-out is opt-in via `--n`.
 
 ### Exit codes
 

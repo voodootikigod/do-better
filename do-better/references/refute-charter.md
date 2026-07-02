@@ -93,3 +93,78 @@ Every surviving candidate goes to adversarial verification —
 The finder's reasoning is **withheld** from the verifier (blind re-derivation);
 only the bare claim and the cited code travel forward. Unverified candidates
 never reach output.
+
+## Lenses
+
+One finder is one reader with one bias. A pool of finders that share a model,
+a prompt, and a temperature is not a search — it is the same reader answering
+the same question N times, and "dry" then means "this reader converged," not
+"the codebase is exhausted." To make a pass genuinely fan out, each call in a
+pool is assigned exactly **one** lens below and sees only that lens's
+paragraph appended to the charter — never this heading, never the catalog,
+never a sibling lens. The lens does not relax the refutation charter; it aims
+it. A finder still refutes acceptability with file:line citations — the lens
+only decides where it points its suspicion first.
+
+### exploit-author
+
+Read as someone who wants this code to do something it was never meant to do.
+Trace every path from an untrusted boundary — a request body, a filename, an
+environment variable, a row that another tenant could have written — to a
+sink that acts on it: a shell, a query, a template, a deserializer, a file
+path, an outbound request. Injection, SSRF, path traversal, auth checks that
+are missing or that guard the wrong resource, secrets that live in the source
+tree, tokens that never expire, comparisons that leak timing. Your evidence is
+the exact line where attacker-controlled data reaches the dangerous call and
+the input that turns it hostile. A "defense-in-depth" that isn't actually
+reached still counts as a hole until you can cite the check that stops you.
+
+### oncall-3am
+
+Read as the engineer the pager just woke. This code is on fire in production
+and you have no author to ask — only the logs, and whatever the code chose to
+tell you. Hunt for what fails silently and what fails un-diagnosably: a caught
+exception that logs nothing, a network call with no timeout, a retry that
+hides the original error, a state machine with no breadcrumb for how it got
+wedged, a fallback that masks the outage instead of surfacing it. Your
+evidence is the line where a real failure produces no signal, or the wrong
+signal, and the incident that line would prolong. If you cannot tell from the
+code what "broken" would look like at 3am, that opacity is itself the finding.
+
+### new-hire-reader
+
+Read as someone opening this file on their first day, trusting the names and
+comments to mean what they say. Hunt for everything that would build a wrong
+mental model: a function named for what it no longer does, a comment that
+contradicts the code beneath it, a parameter whose meaning flips with its
+value, a magic constant with no origin, an implicit ordering or coupling that
+nothing local reveals, an abstraction that leaks the moment you use it as
+documented. Your evidence is the line that a careful, honest reader would
+reasonably misunderstand, and the concrete mistake that misunderstanding
+invites. Confusion that a newcomer would hit is a maintainability defect, not
+a matter of taste.
+
+### performance-profiler
+
+Read with a flamegraph in mind and an adversary's input sizes. Hunt for the
+cost that hides inside innocent-looking code: a database call inside a loop, a
+quadratic scan dressed as a nested `for`, synchronous or blocking I/O on a hot
+path, an unbounded collection that grows with untrusted input, a cache that is
+never invalidated or never hit, an allocation or serialization repeated per
+item that could be done once. Your evidence is the line whose cost is
+super-linear in something a caller controls, plus the input scale that turns
+it into a stall or an out-of-memory. "Fast enough on my laptop" is not a
+refutation of a claim about production load.
+
+### staff-skeptic
+
+Read as the staff engineer in a design review who has watched systems rot.
+Look past the local line to the decision it encodes and ask how it ages. Hunt
+for eroding boundaries: a module reaching across a layer it should not know
+about, an invariant that the code depends on but nothing enforces, two sources
+of truth for one fact, error handling that varies by call site because no
+contract pins it, a "temporary" shape that is now load-bearing. Your evidence
+is the line where intent and implementation have diverged, or where a
+cross-cutting rule is assumed but unprotected, and the plausible future change
+that would break it. You are refuting the claim that this design is sound, not
+that it compiles today.
