@@ -8,7 +8,7 @@ import {
   readPackageFile, gitHeadSha, TAXONOMY,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, nextFindingId } from "./state.js";
-import { LAYOUT, readArtifact, readFindings, runReproCheck, verifyCitations, writeFinding } from "./artifacts.js";
+import { LAYOUT, readArtifact, readFindings, runReproCheck, verifyCitations, writeArtifact, writeFinding } from "./artifacts.js";
 import { withFallback, cleanJsonResponse } from "./llm.js";
 
 export const PHASE_ID = "identify";
@@ -16,7 +16,7 @@ export const K_DRY = 2;
 export const MAX_PASSES = 8;
 
 const SEVERITIES = new Set(["critical", "high", "medium", "low"]);
-const PACKET_BYTES = 30_000;
+export const PACKET_BYTES = 30_000;
 const SLICE_CHARS = 24_000;
 const REPRO_TIMEOUT_MS = 30_000;
 const FALLBACK_REFUTE =
@@ -82,12 +82,6 @@ function validateCandidate(raw, dimensionId, log) {
     method: raw.method === "static" ? "static" : null,
     check: raw.check ?? null,
   };
-}
-
-function rotate(arr, by) {
-  if (arr.length === 0) return arr;
-  const r = by % arr.length;
-  return arr.slice(r).concat(arr.slice(0, r));
 }
 
 function parseExtraDimensions(value) {
@@ -186,15 +180,60 @@ function loadSlices(root, files) {
   return slices;
 }
 
-function buildFinderPacket(slices) {
+// One slice → its numbered, file-delimited chunk (the unit of packetization).
+function renderSlice(s) {
+  const numbered = s.raw.split("\n").map((l, i) => `${i + 1}: ${l}`).join("\n");
+  return `\n=== ${s.file} ===\n${numbered}\n`;
+}
+
+// Render a group of slices into a single finder packet. Skip-and-continue (NOT
+// break): a chunk that would overflow maxBytes is skipped so later slices still
+// get a chance; a SINGLE chunk larger than maxBytes is hard-truncated rather
+// than dropped — given ≥1 readable slice the packet is never empty. Callers
+// that need every slice covered must partition first (partitionSlices), which
+// only ever hands this a group that already fits (or a lone oversized slice).
+function buildFinderPacket(slices, maxBytes = PACKET_BYTES) {
   let packet = "";
   for (const s of slices) {
-    const numbered = s.raw.split("\n").map((l, i) => `${i + 1}: ${l}`).join("\n");
-    const chunk = `\n=== ${s.file} ===\n${numbered}\n`;
-    if (packet.length + chunk.length > PACKET_BYTES) break;
+    const chunk = renderSlice(s);
+    if (chunk.length > maxBytes) {
+      packet += truncate(chunk, maxBytes);
+      continue;
+    }
+    if (packet.length + chunk.length > maxBytes) continue;
     packet += chunk;
   }
   return packet || "(no deep-read slices available)";
+}
+
+// Partition the WHOLE readable deep-read set into finder packets: every slice
+// lands in exactly one packet, in input order; a slice whose rendered chunk
+// exceeds maxBytes becomes its own hard-truncated singleton packet; non-empty
+// input never yields []. This replaces the old "rotate one shared window"
+// scheme — the loop now examines the entire set, never just the head.
+export function partitionSlices(slices, maxBytes = PACKET_BYTES) {
+  const packets = [];
+  let group = [];
+  let groupBytes = 0;
+  const flush = () => {
+    if (group.length === 0) return;
+    packets.push({ files: group.map((s) => s.file), packet: buildFinderPacket(group, maxBytes) });
+    group = [];
+    groupBytes = 0;
+  };
+  for (const s of slices) {
+    const chunk = renderSlice(s);
+    if (chunk.length > maxBytes) {
+      flush();
+      packets.push({ files: [s.file], packet: buildFinderPacket([s], maxBytes) });
+      continue;
+    }
+    if (groupBytes + chunk.length > maxBytes) flush();
+    group.push(s);
+    groupBytes += chunk.length;
+  }
+  flush();
+  return packets;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +444,103 @@ async function verifyCandidate(ctx, cand, head7) {
 }
 
 // ---------------------------------------------------------------------------
+// D2 finder coverage manifest (§7.6) — an auditable record of exactly what the
+// packetized finder loop examined, written idempotently into D1's
+// coverage-manifest.md.
+// ---------------------------------------------------------------------------
+const D2_COVERAGE_HEADING = "## D2 finder coverage";
+
+function d2CoverageSection({ dims, offline, passesByDimension, packetsByDimension, examinedFiles, truncatedFiles, unreadableFiles }) {
+  const examinedTxt = examinedFiles.length ? examinedFiles.join(", ") : "(none)";
+  const truncatedTxt = truncatedFiles.length ? truncatedFiles.join(", ") : "(none)";
+  const lines = [D2_COVERAGE_HEADING, ""];
+  for (const dim of dims) {
+    const packets = packetsByDimension[dim.id] ?? 0;
+    const passes = passesByDimension[dim.id] ?? 0;
+    lines.push(`### ${dim.id}`);
+    lines.push(`- Files examined: ${examinedTxt}`);
+    lines.push(`- Packets: ${packets}${offline ? " (offline — no packetization)" : ""}`);
+    lines.push(`- Total passes: ${passes}`);
+    lines.push(`- Truncated slices: ${truncatedTxt}`);
+    lines.push("");
+  }
+  lines.push("### Unexamined");
+  if (unreadableFiles.length === 0) lines.push("- (none)");
+  else for (const f of unreadableFiles) lines.push(`- ${f} (unreadable)`);
+  return lines.join("\n");
+}
+
+// Replace the existing "## D2 finder coverage" section (if present) or append a
+// fresh one — idempotent, so re-runs update rather than duplicate.
+function replaceOrAppendD2Section(body, section) {
+  const lines = String(body ?? "").split("\n");
+  const start = lines.findIndex((l) => l.trim() === D2_COVERAGE_HEADING);
+  let head, tail;
+  if (start === -1) {
+    head = lines;
+    tail = [];
+  } else {
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].startsWith("## ")) { end = i; break; }
+    }
+    head = lines.slice(0, start);
+    tail = lines.slice(end);
+  }
+  const headTxt = head.join("\n").replace(/\s+$/, "");
+  const tailTxt = tail.join("\n").replace(/^\s+/, "").replace(/\s+$/, "");
+  const parts = headTxt ? [headTxt, "", section] : [section];
+  if (tailTxt) parts.push("", tailTxt);
+  return parts.join("\n").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "") + "\n";
+}
+
+function writeD2Coverage(dotdir, data) {
+  const rel = LAYOUT.comprehension.coverageManifest;
+  const existing = readArtifact(dotdir, rel);
+  const meta = existing?.meta ?? {};
+  const body = existing?.body ?? "# Coverage Manifest\n";
+  writeArtifact(dotdir, rel, { meta, body: replaceOrAppendD2Section(body, d2CoverageSection(data)) });
+}
+
+// One (dimension × packet) cell: loop-until-dry (K_DRY consecutive zero-new
+// passes, MAX_PASSES cap). priorConclusions is pool-wide per dimension — a
+// candidate already found via another packet is never re-proposed here.
+async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, refuteSystem, taxonomyDoc }) {
+  const { llm, log } = ctx;
+  const newCands = [];
+  let dryStreak = 0;
+  let pass = 0;
+  while (pass < MAX_PASSES && dryStreak < K_DRY) {
+    pass += 1;
+    const priorList = priorFixed.concat(pool.map((c) => ({ title: c.title, file: c.file })));
+    const priorTxt = priorList.length
+      ? priorList.map((c) => `- ${c.title} (${c.file})`).join("\n")
+      : "(none)";
+    const prompt =
+      `Dimension under refutation: ${dim.label} (charter weight ${dim.weight}).\n\n` +
+      `${dimensionBrief(taxonomyDoc, dim)}\n\n` +
+      `Conclusions of prior passes — do NOT repeat these; find NEW evidence or return an empty list:\n${priorTxt}\n\n` +
+      `Code under review:\n${packetText}\n\n` +
+      'Return JSON {"candidates":[{"title":"...","claim":"...","file":"src/x.js","line":12,"severity":"critical|high|medium|low","confidence":0.8}]} — empty array if nothing new.';
+    const obj = await jsonCall(llm, { prompt, system: refuteSystem, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
+    const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
+    let newCount = 0;
+    for (const r of raw) {
+      const cand = validateCandidate(r, dim.id, log);
+      if (!cand) continue;
+      const key = dedupeKey(cand);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pool.push(cand);
+      newCands.push(cand);
+      newCount += 1;
+    }
+    dryStreak = newCount === 0 ? dryStreak + 1 : 0;
+  }
+  return { passes: pass, dry: dryStreak >= K_DRY, newCands };
+}
+
+// ---------------------------------------------------------------------------
 // Phase entry point
 // ---------------------------------------------------------------------------
 export async function run(ctx) {
@@ -424,28 +560,86 @@ export async function run(ctx) {
     const dims = orderedDimensions(charterArt.meta ?? {});
     const refuteSystem = loadRef("refute-charter.md", FALLBACK_REFUTE);
     const taxonomyDoc = loadRef("taxonomy.md", "");
-    const slices = loadSlices(root, deepReadFileList(dotdir, state));
+    const declaredFiles = deepReadFileList(dotdir, state);
+    const slices = loadSlices(root, declaredFiles);
+    const examinedFiles = slices.map((s) => s.file);
+    const unreadableFiles = declaredFiles.filter((f) => !examinedFiles.includes(f));
+    const truncatedFiles = slices.filter((s) => renderSlice(s).length > PACKET_BYTES).map((s) => s.file);
+
+    // Partition the whole readable set into packets (online only); offline runs
+    // a single deterministic static pass and does not consume packets.
+    const packets = offline ? [] : partitionSlices(slices);
+
+    // Starvation is a gate failure, never a silent zero-finding pass: an online
+    // run with no readable deep-read files has nothing to examine (F4).
+    if (!offline && packets.length === 0) {
+      state = addSpend(state, PHASE_ID, llm.drainSpend());
+      state = setGate(state, "identify", { passed: false, dryPassesByDimension: {}, packetsByDimension: {}, unverified: 0 });
+      state = recordPhase(state, PHASE_ID, { status: "failed", sha: headSha, now: now() });
+      const detail =
+        `deep-read set is empty or unreadable — no packets to examine online ` +
+        `(${declaredFiles.length} declared, ${examinedFiles.length} readable); ` +
+        "re-run D1 comprehend so D2 has code to refute, or use --offline for a static-only pass.";
+      const err = makeGateError(`Gate failed: identify — ${detail}`, "identify", detail);
+      err.state = state;
+      throw err;
+    }
+
+    // Persisted per-cell dry state: on a re-run against the SAME headSha
+    // (resuming after a BudgetError before the next phase pins a new sha),
+    // packets already recorded dry are skipped — zero finder calls reissued. A
+    // sha change discards this entirely (full re-examination).
+    const priorIdentify = state?.phases?.identify ?? {};
+    const priorDry = priorIdentify.dryCellsSha === headSha ? (priorIdentify.dryCellsByDimension ?? {}) : {};
 
     const passesByDimension = {};
-    const notDry = [];
+    const packetsByDimension = {};
+    const dryCellsByDimension = {};
+    const notDry = []; // [{ dim, packet }] — starvation detail names dimension AND packet
     const counts = {};
     // D6 idempotency: seed the dedupe set from already-verified findings so
     // re-runs reconcile against .dobetter/findings/ instead of duplicating
-    // finding files and burning new IDs for identical claims.
+    // finding files and burning new IDs for identical claims. The same findings
+    // seed each dimension's prior-conclusions, so a resumed cell picks up from
+    // its recorded pool instead of a blank slate.
     const seen = new Set();
+    const priorByDim = {};
     for (const prior of readFindings(dotdir)) {
       const file = prior.evidence?.[0]?.file ?? "";
       seen.add(dedupeKey({ dimension: prior.dimension, file, claim: prior.claim ?? prior.title }));
       seen.add(dedupeKey({ dimension: prior.dimension, file, claim: prior.title }));
+      (priorByDim[prior.dimension] ??= []).push({ title: prior.title, file });
     }
     let killed = 0;
     let verifiedCount = 0;
 
+    // reproduce-or-kill — unverified findings never reach output (D8/F4).
+    const verifyAndRecord = async (dimId, candidates) => {
+      for (const cand of candidates) {
+        const verdict = await verifyCandidate(ctx, cand, head7);
+        if (verdict.verified) {
+          const next = nextFindingId(state, dimId);
+          state = next.state;
+          writeFinding(dotdir, {
+            id: next.id, dimension: dimId, title: cand.title, claim: cand.claim, severity: cand.severity,
+            confidence: cand.confidence, evidence: verdict.evidence, reproduction: verdict.reproduction,
+            status: "verified", foundAt: now(), headSha, stale: false,
+          });
+          verifiedCount += 1;
+          counts[dimId].verified += 1;
+        } else {
+          killed += 1;
+          counts[dimId].killed += 1;
+          log?.substep?.(`killed [${dimId}] ${cand.title} — ${verdict.reason}`);
+        }
+      }
+    };
+
     for (const dim of dims) {
-      const pool = [];
       counts[dim.id] = { verified: 0, killed: 0 };
 
       if (offline) {
+        const pool = [];
         for (const raw of staticFinderPass(dim.id, root, slices)) {
           const cand = validateCandidate(raw, dim.id, log);
           if (!cand) continue;
@@ -455,73 +649,62 @@ export async function run(ctx) {
           if (!seen.has(key)) { seen.add(key); pool.push(cand); }
         }
         passesByDimension[dim.id] = 1; // single deterministic pass, dry by construction (declared degradation)
-      } else {
-        let dryStreak = 0;
-        let pass = 0;
-        while (pass < MAX_PASSES && dryStreak < K_DRY) {
-          pass += 1;
-          const rotated = rotate(slices, pass - 1);
-          const priorTxt = pool.length
-            ? pool.map((c) => `- ${c.title} (${c.file})`).join("\n")
-            : "(none)";
-          const prompt =
-            `Dimension under refutation: ${dim.label} (charter weight ${dim.weight}).\n\n` +
-            `${dimensionBrief(taxonomyDoc, dim)}\n\n` +
-            `Conclusions of prior passes — do NOT repeat these; find NEW evidence or return an empty list:\n${priorTxt}\n\n` +
-            `Code under review:\n${buildFinderPacket(rotated)}\n\n` +
-            'Return JSON {"candidates":[{"title":"...","claim":"...","file":"src/x.js","line":12,"severity":"critical|high|medium|low","confidence":0.8}]} — empty array if nothing new.';
-          const obj = await jsonCall(llm, { prompt, system: refuteSystem, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
-          const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
-          let newCount = 0;
-          for (const r of raw) {
-            const cand = validateCandidate(r, dim.id, log);
-            if (!cand) continue;
-            const key = dedupeKey(cand);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            pool.push(cand);
-            newCount += 1;
-          }
-          dryStreak = newCount === 0 ? dryStreak + 1 : 0;
-        }
-        passesByDimension[dim.id] = pass;
-        if (dryStreak < K_DRY) notDry.push(dim.id);
+        packetsByDimension[dim.id] = 0; // offline: no packetization
+        await verifyAndRecord(dim.id, pool);
+        continue;
       }
 
-      // reproduce-or-kill — unverified findings never reach output (D8/F4)
-      for (const cand of pool) {
-        const verdict = await verifyCandidate(ctx, cand, head7);
-        if (verdict.verified) {
-          const next = nextFindingId(state, dim.id);
-          state = next.state;
-          writeFinding(dotdir, {
-            id: next.id, dimension: dim.id, title: cand.title, claim: cand.claim, severity: cand.severity,
-            confidence: cand.confidence, evidence: verdict.evidence, reproduction: verdict.reproduction,
-            status: "verified", foundAt: now(), headSha, stale: false,
-          });
-          verifiedCount += 1;
-          counts[dim.id].verified += 1;
-        } else {
-          killed += 1;
-          counts[dim.id].killed += 1;
-          log?.substep?.(`killed [${dim.id}] ${cand.title} — ${verdict.reason}`);
+      const pool = [];
+      const priorFixed = priorByDim[dim.id] ?? [];
+      const priorDryForDim = priorDry[dim.id] ?? [];
+      const dryCells = [];
+      let totalPasses = 0;
+      for (let pi = 0; pi < packets.length; pi++) {
+        if (priorDryForDim.includes(pi)) {
+          dryCells.push(pi); // recorded dry on a prior same-sha run — skip, no finder calls
+          continue;
         }
+        const cell = await finderCell(ctx, {
+          dim, packetText: packets[pi].packet, pool, priorFixed, seen, refuteSystem, taxonomyDoc,
+        });
+        totalPasses += cell.passes;
+        if (cell.dry) dryCells.push(pi);
+        else notDry.push({ dim: dim.id, packet: pi });
+        await verifyAndRecord(dim.id, cell.newCands);
+        // Persist incrementally so a BudgetError mid-loop leaves the dry-cell
+        // state (and verified findings, already on disk) recoverable on re-run.
+        passesByDimension[dim.id] = totalPasses;
+        packetsByDimension[dim.id] = packets.length;
+        dryCellsByDimension[dim.id] = dryCells.slice();
+        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha });
       }
+      passesByDimension[dim.id] = totalPasses;
+      packetsByDimension[dim.id] = packets.length;
+      dryCellsByDimension[dim.id] = dryCells;
+      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha });
     }
 
-    state = patchPhase(state, PHASE_ID, { passesByDimension, killed, verified: verifiedCount });
+    writeD2Coverage(dotdir, {
+      dims, offline, passesByDimension, packetsByDimension, examinedFiles, truncatedFiles, unreadableFiles,
+    });
+
+    state = patchPhase(state, PHASE_ID, {
+      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha,
+      killed, verified: verifiedCount,
+    });
     state = addSpend(state, PHASE_ID, llm.drainSpend());
 
     if (notDry.length > 0) {
-      state = setGate(state, "identify", { passed: false, dryPassesByDimension: passesByDimension, unverified: 0 });
+      state = setGate(state, "identify", { passed: false, dryPassesByDimension: passesByDimension, packetsByDimension, unverified: 0 });
       state = recordPhase(state, PHASE_ID, { status: "failed", sha: headSha, now: now() });
-      const detail = `dimension(s) not dry after ${MAX_PASSES} passes: ${notDry.join(", ")} — finders kept producing new candidates; re-run audit (verified findings so far are preserved in .dobetter/findings/)`;
+      const cellList = notDry.map(({ dim, packet }) => `${dim}[packet ${packet}]`).join(", ");
+      const detail = `cell(s) not dry after ${MAX_PASSES} passes: ${cellList} — finders kept producing new candidates; re-run audit (verified findings so far are preserved in .dobetter/findings/)`;
       const err = makeGateError(`Gate failed: identify — ${detail}`, "identify", detail);
       err.state = state;
       throw err;
     }
 
-    state = setGate(state, "identify", { passed: true, dryPassesByDimension: passesByDimension, unverified: 0 });
+    state = setGate(state, "identify", { passed: true, dryPassesByDimension: passesByDimension, packetsByDimension, unverified: 0 });
     state = recordPhase(state, PHASE_ID, { status: "done", sha: headSha, now: now() });
     state = pinSha(state, PHASE_ID, headSha);
 
@@ -529,7 +712,7 @@ export async function run(ctx) {
       .map((d) => `${d.id}: ${counts[d.id].verified} verified / ${counts[d.id].killed} killed (${passesByDimension[d.id]} pass${passesByDimension[d.id] === 1 ? "" : "es"})`)
       .join("; ");
     const summary =
-      `Identify complete @ ${head7}: every dimension ran dry (K=${K_DRY}); ${verifiedCount} finding(s) verified, ${killed} killed, 0 unverified written. ` +
+      `Identify complete @ ${head7}: every (dimension × packet) cell ran dry (K=${K_DRY}); ${verifiedCount} finding(s) verified, ${killed} killed, 0 unverified written. ` +
       (offline ? "DEGRADED: offline static-analysis pass only — re-run online for LLM finders. " : "") +
       `Per dimension — ${perDim}. (Finding counts are not a success metric; ticket quality is.)`;
     return {

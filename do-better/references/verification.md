@@ -103,10 +103,17 @@ every finding ships with the means of its own re-verification.
 
 D2 passes its deterministic gate iff:
 
-1. every dimension went dry within `MAX_PASSES` (see
-   [refute-charter.md](./refute-charter.md)), and
+1. every `(dimension × packet)` cell went dry within `MAX_PASSES` (see
+   [refute-charter.md](./refute-charter.md)) — the deep-read set is partitioned
+   into packets and each cell loops-until-dry independently, so the gate detail
+   names the dimension *and* the packet that stalled, and
 2. the count of unverified findings written is exactly **zero** — true by
    construction, asserted anyway.
+
+An empty or unreadable deep-read set online is also a gate failure (exit 2):
+with no packets to examine, "dry" would be vacuously true, so starvation is
+surfaced rather than passed silently. Offline is exempt — it consumes no
+packets and runs a single deterministic static pass per dimension.
 
 Either condition failing is exit 2. The findings count is never a success
 metric (D11); ten verified findings beat a hundred plausible ones.
