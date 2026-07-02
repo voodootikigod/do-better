@@ -241,9 +241,21 @@ function makeCtx({ root, dotdir, state, fakeLLMFile = null, offline = false }) {
 test("identify.run(ctx) throws OpError (exitCode 1) when the comprehend gate has not passed", async (t) => {
   const { root, dotdir, headSha } = makeRepo(t);
   const now = new Date().toISOString();
-  // Freshly initialized state: gates.comprehend.passed is false by construction
-  // (defaultState's own contract — see state.test.js) and never touched here.
-  const state = stateMod.defaultState({ headSha, now });
+  // Isolate the ONE precondition under test: every OTHER D1/D0 prerequisite
+  // (charter artifact on disk, scan/charter phases recorded) is satisfied so
+  // the comprehend-gate check is the only thing that can fire. Without this,
+  // gates.comprehend.passed being false and no charter.md on disk are BOTH
+  // true, and a mutation spot-check confirmed the assertion below cannot
+  // distinguish "comprehend gate check fired" from "charter-missing check
+  // fired next" — both produce an indistinguishable OpError/exitCode:1 under
+  // the non-pin rule (no exact message assertion allowed). Writing the
+  // charter artifact closes that gap.
+  writeComprehensionInputs(dotdir, headSha, now);
+  let state = stateMod.defaultState({ headSha, now });
+  state = stateMod.recordPhase(state, "scan", { status: "done", sha: headSha, now });
+  state = stateMod.setGate(state, "charter", { approved: true, approvedAt: now, charterSha256: "0".repeat(64) });
+  // gates.comprehend.passed is left false by construction — the one
+  // condition this test exists to pin.
   const fakeFile = writeFakeLLM(t, {});
   const ctx = makeCtx({ root, dotdir, state, fakeLLMFile: fakeFile });
 
