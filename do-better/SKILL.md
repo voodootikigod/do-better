@@ -203,15 +203,34 @@ CLI: `npx do-better audit` (runs D1 then D2).
 Goal: findings that survive hostile scrutiny. Two separated roles, never the
 same context: **finders** propose, **verifiers** kill.
 
-1. For each dimension (all 8 + charter extras, descending weight), run
+1. **Packetize the whole deep-read set.** The readable deep-read files are
+   partitioned into finder **packets** (`partitionSlices`) — every file lands
+   in exactly one packet, in order, and a file too large for one packet becomes
+   its own hard-truncated singleton. This replaces the old "rotate one shared
+   ≤30 KB window" scheme, which could only ever show the finder the head of the
+   set (and, with an oversized head slice, nothing at all). For each dimension
+   (all 8 + charter extras, descending weight) and each packet, run
    fresh-context finder passes under the refutation charter
    ([references/refute-charter.md](references/refute-charter.md)): chartered to
    REFUTE acceptability, file:line on every claim, low-confidence included.
-   Each pass sees rotated code slices and prior passes' **conclusions only**
-   (titles + files, never transcripts).
-2. **Loop until dry**: a pass with zero new candidates (deduped on
-   dimension + file + normalized claim) is dry; stop at K=2 consecutive dry
-   passes; a dimension not dry within 8 passes fails the gate.
+   Each pass sees one packet's code plus prior passes' **conclusions only**
+   (titles + files pool-wide across the dimension's packets, never transcripts —
+   a finding from packet 1 is never re-proposed against packet 3).
+2. **Loop each (dimension × packet) cell until dry**: a pass with zero new
+   candidates (deduped on dimension + file + normalized claim) is dry; stop at
+   K=2 consecutive dry passes; a cell not dry within 8 passes fails the gate
+   (the failure detail names the dimension AND the packet). An empty/unreadable
+   deep-read set online is a gate failure too — starvation is never a silent
+   zero-finding pass. Packets that reached K=2 are recorded per head sha, so a
+   same-sha resume (after a `--budget` stop) skips them with zero re-issued
+   finder calls; a sha change discards that state and re-examines everything.
+   After the loop, a **`## D2 finder coverage`** section is written idempotently
+   into `comprehension/coverage-manifest.md`: per dimension the files examined,
+   packet count, total passes, and truncated slices, with unreadable deep-read
+   files under `### Unexamined`. Cost scales as
+   dimensions × packets × passes × poolN; `--budget` is the hard ceiling and a
+   mid-loop stop preserves every finding verified so far (findings are written
+   per candidate, not batched).
 3. **Verify every candidate** per
    [references/verification.md](references/verification.md): deterministic
    citation check, then mechanical reproduction (whitelisted command shapes,
