@@ -93,9 +93,25 @@ CLI flags (manual mode: treat each as an instruction you honor by hand):
 | `--model-cheap / --model-mid / --model-frontier <id>` | Override one tier's model (see Model tiering). | Model names are validated; shell-metacharacter names are rejected. |
 | `--target <dir>` (or 2nd positional) | Target repo. Default `.`. | Must be a git repository — claims are SHA-pinned, so no git means no run. |
 | `--approve` | (`charter`, `roadmap`) Approve the human-gated artifact as it now stands on disk. | Approval re-validates: charter must satisfy the taxonomy floor; roadmap requires a clean coldstart gate. |
-| `--n <N>` / `--threshold <t>` | (`audit`) Parallax fan width / divergence threshold. Defaults 3 / 0.25. | Divergence ≥ threshold fails the gate (exit 2) — it is a finding about confusion, not noise to ignore. |
+| `--n <N>` / `--threshold <t>` | (`audit`) D1 parallax fan width (default 3) **and** the D2 finder-pool ceiling / divergence threshold (default 0.25). | Divergence ≥ threshold fails the gate (exit 2) — it is a finding about confusion, not noise to ignore. In D2, `--n` is the *maximum* pool width; the effective width is charter-weighted (table below), so a low-weight dimension never over-fans. Unset, the D2 pool ceiling is **1** (pooling is opt-in; lens rotation across passes is always on). |
 | `--yes` | Skip confirmations (e.g. the D4 rails commit). | Never skips the two human gates — those have no bypass flag, by design. |
 | `--json` | Machine summary on stdout. | — |
+
+**D2 charter-weighted pool width** (fan `N` distinct-lens finders per pass, so
+"dry" means the codebase is exhausted, not that one context converged). Given
+`--n` as the ceiling:
+
+| Charter weight | Effective pool width |
+|---|---|
+| 4–5 | `--n` (full width) |
+| 2–3 | `max(1, floor(--n / 2))` |
+| 1 | `1` (no pooling — identical to the single-finder pre-pool behavior) |
+
+At `--n 1` every dimension is width 1 regardless of weight (`min(1, …) = 1`),
+reproducing the pre-pool single-finder call counts exactly. Each pooled call
+sees the refute charter plus exactly one lens
+([references/refute-charter.md](references/refute-charter.md) `## Lenses`) —
+never the catalog, never a sibling lens.
 
 Exit codes (the adlc-universal contract): **0** success or a clean human-gate
 pause with printed resume instructions · **1** operational error (bad input,
