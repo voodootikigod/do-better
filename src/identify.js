@@ -32,6 +32,17 @@ const REPRO_SYSTEM =
   '`node --test <relative test file>`, `node -e "<snippet ≤500 chars>"` (snippet must exit 0 iff the issue is present), ' +
   'or a native grep as {"grep":{"pattern":"<regex>","file":"<relative path>"}}. ' +
   'If no deterministic check exists, return {"reproCmd":null}. Respond with JSON only.';
+// T3 semantic dedupe: a cheap-tier equivalence judge layered OVER the free hash
+// filter. It sees a numbered list of prior findings (same dimension+file) and
+// one new finding, and decides whether the new one merely restates a prior in
+// different words. Bias toward "new" (null) — false-new is cheap, false-dup is
+// unrecoverable (see the fail-open doctrine at the call site).
+const DEDUPE_SYSTEM =
+  "You judge whether a NEW code finding is a SEMANTIC DUPLICATE of one already recorded — the same " +
+  "underlying issue restated in different words, not merely a finding in the same file or area. " +
+  'You are given a numbered list of prior findings and one new finding. Respond with JSON ' +
+  '{"duplicateOf": <the index of the prior finding it duplicates, or null if it is genuinely new>}. ' +
+  "Return an index ONLY when you are confident it is the same issue; when in any doubt, return null.";
 
 // The five finder lenses (T2 pooled parallax). IDs are fixed doctrine; the
 // paragraph text lives in refute-charter.md's "## Lenses" section and is loaded
@@ -519,6 +530,61 @@ async function verifyCandidate(ctx, cand, head7) {
 }
 
 // ---------------------------------------------------------------------------
+// T3 semantic dedupe — the SECOND admission filter, layered over the free hash
+// filter (dedupeKey). Only hash-survivors reach here, and only online (the
+// offline path never calls finderCell). One cheap-tier call per survivor,
+// comparing it against `priorSameCell` — prior ADMITTED entries (this run's
+// pool + prior VERIFIED findings) that share the candidate's dimension AND
+// file. Returns true iff the model judges the candidate a paraphrase of one of
+// them.
+//
+// FAILS OPEN — deliberately, and this is the ONE sanctioned fail-open path in
+// D2; every other failure here fails CLOSED (drop the candidate, kill the
+// finding). An unparseable response, an out-of-range index, or a thrown error
+// (network exhaustion, bad JSON) is treated as "not a duplicate" → the
+// candidate is ADMITTED. Rationale for the asymmetry: a false NEW costs one
+// wasted downstream verification call — and verification kills genuine junk
+// anyway — whereas a false DUPLICATE permanently suppresses a real finding that
+// nothing downstream can resurrect. When the cheap judge is uncertain or
+// broken, admitting is the recoverable error. (BudgetError is NOT a
+// semantic-check failure — it is the hard spend ceiling, so it still rethrows
+// stop-the-world, matching every other call site in this file.)
+async function isSemanticDuplicate(ctx, cand, priorSameCell) {
+  const { llm, log } = ctx;
+  if (priorSameCell.length === 0) return false; // nothing to be a duplicate of — skip the call entirely
+  const list = priorSameCell
+    .map((p, i) => `${i}. title: ${p.title}\n   claim: ${p.claim}`)
+    .join("\n");
+  const prompt =
+    `Prior findings for dimension "${cand.dimension}" in ${cand.file}:\n${list}\n\n` +
+    `New finding:\n   title: ${cand.title}\n   claim: ${cand.claim}\n\n` +
+    'Is the new finding a semantic duplicate of one listed above? Respond {"duplicateOf": <index>|null}.';
+  try {
+    const obj = await jsonCall(llm, {
+      prompt, system: DEDUPE_SYSTEM, tier: "cheap", label: `dedupe:${cand.dimension}`,
+    }, () => ({ duplicateOf: null }));
+    const idx = obj?.duplicateOf;
+    if (idx === null || idx === undefined) return false; // model says genuinely new
+    const n = Number(idx);
+    if (Number.isInteger(n) && n >= 0 && n < priorSameCell.length) return true;
+    // Out-of-range / non-integer index: fail OPEN — admit. (See doctrine above.)
+    log?.warn?.(
+      `dedupe:${cand.dimension}: semantic check returned an out-of-range index ${JSON.stringify(idx)} ` +
+      `(list length ${priorSameCell.length}) — fail open, admitting the candidate.`,
+    );
+    return false;
+  } catch (e) {
+    if (e instanceof BudgetError) throw e; // budget ceiling stops the world, never fails open
+    // Network exhaustion / unparseable JSON after the LLM layer's own retries:
+    // fail OPEN — admit. (See doctrine above.)
+    log?.warn?.(
+      `dedupe:${cand.dimension}: semantic check failed (${e.message}) — fail open, admitting the candidate.`,
+    );
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // D2 finder coverage manifest (§7.6) — an auditable record of exactly what the
 // packetized finder loop examined, written idempotently into D1's
 // coverage-manifest.md.
@@ -616,7 +682,25 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, 
         const cand = validateCandidate(r, dim.id, log);
         if (!cand) continue;
         const key = dedupeKey(cand);
+        // (a) Hash filter — free, unchanged, FIRST. Exact/normalized-wording
+        // repeats never reach the semantic tier.
         if (seen.has(key)) continue;
+        // (b) Semantic filter (T3) — hash-survivors only, online only. Compare
+        // against prior ADMITTED entries (prior verified findings + this run's
+        // pool) sharing this candidate's dimension AND file. A judged paraphrase
+        // is suppressed: it does NOT join the pool or become a finding, and it
+        // is NOT counted toward newCount (so it neither resets nor blocks the
+        // dry streak). Its hash key IS recorded, so the identical paraphrase is
+        // not re-litigated by a later pass.
+        if (!llm.offline) {
+          const priorSameCell = priorFixed
+            .concat(pool)
+            .filter((p) => p.dimension === cand.dimension && p.file === cand.file);
+          if (await isSemanticDuplicate(ctx, cand, priorSameCell)) {
+            seen.add(key);
+            continue;
+          }
+        }
         seen.add(key);
         pool.push(cand);
         newCands.push(cand);
@@ -698,7 +782,13 @@ export async function run(ctx) {
       const file = prior.evidence?.[0]?.file ?? "";
       seen.add(dedupeKey({ dimension: prior.dimension, file, claim: prior.claim ?? prior.title }));
       seen.add(dedupeKey({ dimension: prior.dimension, file, claim: prior.title }));
-      (priorByDim[prior.dimension] ??= []).push({ title: prior.title, file });
+      // dimension + claim ride along (beyond title/file) so the T3 semantic
+      // filter can offer prior verified findings as same-cell comparison
+      // entries — a paraphrase of a finding verified in a PREVIOUS run is caught
+      // too, not just repeats within this run.
+      (priorByDim[prior.dimension] ??= []).push({
+        dimension: prior.dimension, title: prior.title, claim: prior.claim ?? prior.title, file,
+      });
     }
     let killed = 0;
     let verifiedCount = 0;
