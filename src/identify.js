@@ -818,17 +818,27 @@ export async function run(ctx) {
     // interrupted run's incremental patches always persist it as false.
     const priorIdentify = state?.phases?.identify ?? {};
     const priorComplete = priorIdentify.dryCellsComplete === true;
-    // Honored only when the commit sha AND the content fingerprint both
-    // match (round-4 adversarial review finding): sha alone is not enough —
-    // packet identity is positional and content is read from the working
-    // tree, so uncommitted edits or a regenerated deep-read list (D1
-    // comprehend re-runs on every `audit`) can shift what a positional index
-    // refers to while headSha stays constant. Any drift in the fingerprint
-    // invalidates the WHOLE cache — see packetSetFingerprint's comment for
-    // why whole-set invalidation, not per-packet reconciliation.
+    // Honored only when the commit sha, the content fingerprint, AND the
+    // search width all match (round-5 adversarial review finding, extending
+    // round 4): sha+fingerprint alone are not enough — a cell recorded dry
+    // at a NARROWER pool width (fewer lenses fanned over it) was never
+    // actually searched as hard as a WIDER --n on resume intends. This is
+    // the exact "dry only verified at the OLD width" loss the completion
+    // guard exists to prevent, which round 1 closed only for the
+    // dryCellsComplete===true (successfully-completed) path — the
+    // interrupted/failed-run resume path is equally a case where a user
+    // legitimately widens --n between attempts. A recorded width that is
+    // >= the current poolMax is still safe to trust (more lenses can only
+    // find MORE, never less, so a wider-verified dry cell is also
+    // narrower-verified-dry); only a genuine increase invalidates. poolMax
+    // is the shared ceiling (not per-dimension), so comparing it once here
+    // is equivalent to comparing every dimension's own effective width —
+    // whole-cache invalidation on any increase, same simplicity tradeoff as
+    // the content fingerprint.
     const priorDry = !priorComplete
       && priorIdentify.dryCellsSha === headSha
       && priorIdentify.dryCellsFingerprint === dryCellsFingerprint
+      && (priorIdentify.dryCellsPoolMax ?? 1) >= poolMax
       ? (priorIdentify.dryCellsByDimension ?? {})
       : {};
     // Reset for THIS run — and this must clear the PERSISTED dry-cell data
@@ -842,14 +852,15 @@ export async function run(ctx) {
     // stale set alongside dryCellsComplete:false, and the next resume
     // honored it as if it were THIS run's own progress, silently skipping
     // cells the re-audit existed to re-examine). Clearing
-    // dryCellsByDimension/dryCellsSha/dryCellsFingerprint here, in the SAME
-    // patch, means an early interruption's persisted state truthfully shows
-    // "nothing recorded yet for this attempt" rather than resurrecting stale
-    // data. When priorComplete is false (a genuine resume) and both the sha
-    // and fingerprint match, this is a no-op in effect — the existing values
-    // are either what priorDry already captured (resume case) or already
-    // stale (discarded either way by the read above).
-    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha, dryCellsFingerprint });
+    // dryCellsByDimension/dryCellsSha/dryCellsFingerprint/dryCellsPoolMax
+    // here, in the SAME patch, means an early interruption's persisted state
+    // truthfully shows "nothing recorded yet for this attempt" rather than
+    // resurrecting stale data. When priorComplete is false (a genuine
+    // resume) and sha/fingerprint/width all match, this is a no-op in
+    // effect — the existing values are either what priorDry already
+    // captured (resume case) or already stale (discarded either way by the
+    // read above).
+    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax });
 
     const passesByDimension = {};
     const packetsByDimension = {};
@@ -954,12 +965,12 @@ export async function run(ctx) {
         passesByDimension[dim.id] = totalPasses;
         packetsByDimension[dim.id] = packets.length;
         dryCellsByDimension[dim.id] = dryCells.slice();
-        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint });
+        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax });
       }
       passesByDimension[dim.id] = totalPasses;
       packetsByDimension[dim.id] = packets.length;
       dryCellsByDimension[dim.id] = dryCells;
-      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint });
+      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax });
     }
 
     const suppressedByDimension = {};
@@ -969,7 +980,7 @@ export async function run(ctx) {
     });
 
     state = patchPhase(state, PHASE_ID, {
-      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint,
+      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax,
       killed, verified: verifiedCount,
     });
     state = addSpend(state, PHASE_ID, llm.drainSpend());
