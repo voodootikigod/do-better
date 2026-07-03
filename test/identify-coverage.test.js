@@ -683,3 +683,73 @@ test("completion guard, round 3: an EARLY BudgetError (before any per-dimension 
   assert.ok(calls3.some((c) => c.label === "finder:security"), "security was genuinely re-examined on resume, not skipped via stale run-1 data");
   assert.ok(calls3.some((c) => c.label === "finder:correctness"), "correctness (not yet reached when run 2 was interrupted) was ALSO genuinely re-examined, not silently trusted from run 1");
 });
+
+// ---------------------------------------------------------------------------
+// Dry-cell content fingerprint (adversarial review finding, round 4): the
+// resume cache was keyed ONLY on the commit sha, but packet identity is
+// POSITIONAL and content is read from the WORKING TREE, not the committed
+// blob. A same-sha resume with uncommitted edits (the realistic budget-stop
+// resume flow) could silently skip a packet whose content had actually
+// changed since it was recorded dry — never-examined code passing the gate
+// vacuously. This is the "simpler variant" from the review's own exploit
+// scenario: edit a file's content in the working tree between runs, at a
+// CONSTANT commit sha.
+// ---------------------------------------------------------------------------
+
+test("dry-cell fingerprint: a same-sha resume with an uncommitted content edit re-examines the changed packet, not skip it as stale-dry", async (t) => {
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+
+  // Run 1: completes, packet 0 (a.js, containing MARKER_A) recorded dry, with
+  // its fingerprint over MARKER_A's content.
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  assert.deepEqual(result1.state.phases.identify.dryCellsByDimension.security, [0]);
+  const staleFingerprint = result1.state.phases.identify.dryCellsFingerprint;
+  assert.ok(staleFingerprint, "run 1 recorded a fingerprint over MARKER_A's content");
+
+  // Simulate a genuine INTERRUPTED resume (not a completed run): the
+  // completion guard (rounds 2/3) already forces full re-examination after
+  // ANY successful completion, which would make the fingerprint's own effect
+  // unobservable if run 2 simply resumed from a completed result1.state —
+  // packet 0 would be re-examined regardless of fingerprint match/mismatch,
+  // purely because dryCellsComplete was true. Hand-constructing an
+  // interrupted-but-not-complete state isolates the fingerprint check from
+  // the completion guard, exactly as the round-2 test does for `status`.
+  const interruptedState = {
+    ...result1.state,
+    phases: {
+      ...result1.state.phases,
+      identify: {
+        ...result1.state.phases.identify,
+        dryCellsComplete: false, // a genuine interrupted resume, not a completed run
+        dryCellsByDimension: { security: [0] }, // this interrupted run's own recorded-dry progress
+        dryCellsSha: headSha,
+        dryCellsFingerprint: staleFingerprint, // recorded against MARKER_A's content
+      },
+    },
+  };
+
+  // Between the interruption and the resume: edit a.js's content IN THE
+  // WORKING TREE, uncommitted — the commit sha (headSha) does not change,
+  // exactly the realistic scenario (uncommitted work mid-budget-stop-resume,
+  // or any working-tree drift).
+  fs.writeFileSync(path.join(root, "a.js"), packetSizedFile("MARKER_B"));
+
+  // Resume: same headSha, dryCellsComplete:false (a genuine resume the
+  // completion guard would honor), but content has drifted since the
+  // fingerprint was recorded. Without the fingerprint check, packet 0 would
+  // be skipped as "recorded dry" and MARKER_B would never be shown to any
+  // finder — a real content change passing the gate unaudited.
+  const log2 = makeLogFile(t);
+  const ctx2 = makeCtx({ root, dotdir, state: interruptedState, fakeFile: writeFake(t, emptyFinderFake(log2)) });
+  const result2 = await identify.run(ctx2);
+  assert.equal(result2.gate.passed, true);
+
+  const finder2 = readLog(log2).filter((c) => c.label === "finder:security").map((c) => c.prompt);
+  assert.ok(finder2.some((p) => p.includes("MARKER_B")), "the edited content WAS shown to a finder — the fingerprint mismatch correctly discarded the stale positional dry-cell index, despite dryCellsComplete:false and a matching sha (which alone would have honored the stale index)");
+});
