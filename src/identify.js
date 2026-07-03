@@ -766,6 +766,14 @@ export async function run(ctx) {
     const { base: refuteBase, lenses } = parseLenses(loadRef("refute-charter.md", FALLBACK_REFUTE), log);
     const poolMax = charterPoolMax(flags.n);
     const taxonomyDoc = loadRef("taxonomy.md", "");
+    // Each dimension's OWN effective search width — charterPoolWidth depends on
+    // BOTH poolMax (the shared --n ceiling) AND dim.weight (independently
+    // editable per-dimension via charter.md, without touching poolMax, source
+    // content, or headSha). Computed upfront since it only depends on
+    // dims/lenses/poolMax, all already known here.
+    const currentWidthByDimension = Object.fromEntries(
+      dims.map((d) => [d.id, Math.min(charterPoolWidth(d.weight, poolMax), lenses.length)]),
+    );
     const declaredFiles = deepReadFileList(dotdir, state);
     const slices = loadSlices(root, declaredFiles);
     const examinedFiles = slices.map((s) => s.file);
@@ -818,29 +826,34 @@ export async function run(ctx) {
     // interrupted run's incremental patches always persist it as false.
     const priorIdentify = state?.phases?.identify ?? {};
     const priorComplete = priorIdentify.dryCellsComplete === true;
-    // Honored only when the commit sha, the content fingerprint, AND the
-    // search width all match (round-5 adversarial review finding, extending
-    // round 4): sha+fingerprint alone are not enough — a cell recorded dry
-    // at a NARROWER pool width (fewer lenses fanned over it) was never
-    // actually searched as hard as a WIDER --n on resume intends. This is
-    // the exact "dry only verified at the OLD width" loss the completion
-    // guard exists to prevent, which round 1 closed only for the
-    // dryCellsComplete===true (successfully-completed) path — the
-    // interrupted/failed-run resume path is equally a case where a user
-    // legitimately widens --n between attempts. A recorded width that is
-    // >= the current poolMax is still safe to trust (more lenses can only
-    // find MORE, never less, so a wider-verified dry cell is also
-    // narrower-verified-dry); only a genuine increase invalidates. poolMax
-    // is the shared ceiling (not per-dimension), so comparing it once here
-    // is equivalent to comparing every dimension's own effective width —
-    // whole-cache invalidation on any increase, same simplicity tradeoff as
-    // the content fingerprint.
-    const priorDry = !priorComplete
+    // Honored only when the commit sha AND the content fingerprint match
+    // (round-4 finding): these are legitimately whole-cache concerns — any
+    // drift invalidates everything, see packetSetFingerprint's comment.
+    const priorDryRaw = !priorComplete
       && priorIdentify.dryCellsSha === headSha
       && priorIdentify.dryCellsFingerprint === dryCellsFingerprint
-      && (priorIdentify.dryCellsPoolMax ?? 1) >= poolMax
       ? (priorIdentify.dryCellsByDimension ?? {})
       : {};
+    // Per-dimension search-width safety (round-6 finding, extending round 5):
+    // round 5 gated on a single global poolMax, reasoning that comparing it
+    // once was "equivalent to comparing every dimension's own effective
+    // width" — true only when no dimension's WEIGHT changes. charterPoolWidth
+    // depends on BOTH poolMax and dim.weight, and weight is independently
+    // editable per-dimension via charter.md (a human-gated artifact) without
+    // touching poolMax, source content, or headSha. A dimension recorded dry
+    // at a narrower effective width (because its weight was lower then) must
+    // NOT be trusted once its weight rises — that dimension's OWN recorded
+    // dry cells are discarded; unaffected dimensions remain correctly
+    // resumed. Per-dimension, not whole-cache, because weight changes are
+    // inherently per-dimension and whole-cache invalidation here would
+    // needlessly re-examine dimensions nothing changed for.
+    const priorWidthByDimension = priorIdentify.dryCellsWidthByDimension ?? {};
+    const priorDry = Object.fromEntries(
+      dims.map((d) => [
+        d.id,
+        (priorWidthByDimension[d.id] ?? 1) >= currentWidthByDimension[d.id] ? (priorDryRaw[d.id] ?? []) : [],
+      ]),
+    );
     // Reset for THIS run — and this must clear the PERSISTED dry-cell data
     // too, not just the in-memory `priorDry` computed above (round-3
     // adversarial review finding: clearing only `dryCellsComplete` left a
@@ -852,15 +865,25 @@ export async function run(ctx) {
     // stale set alongside dryCellsComplete:false, and the next resume
     // honored it as if it were THIS run's own progress, silently skipping
     // cells the re-audit existed to re-examine). Clearing
-    // dryCellsByDimension/dryCellsSha/dryCellsFingerprint/dryCellsPoolMax
-    // here, in the SAME patch, means an early interruption's persisted state
-    // truthfully shows "nothing recorded yet for this attempt" rather than
-    // resurrecting stale data. When priorComplete is false (a genuine
-    // resume) and sha/fingerprint/width all match, this is a no-op in
-    // effect — the existing values are either what priorDry already
-    // captured (resume case) or already stale (discarded either way by the
-    // read above).
-    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax });
+    // dryCellsByDimension/dryCellsSha/dryCellsFingerprint/
+    // dryCellsWidthByDimension here, in the SAME patch, means an early
+    // interruption's persisted state truthfully shows "nothing recorded yet
+    // for this attempt" rather than resurrecting stale data. When
+    // priorComplete is false (a genuine resume) and sha/fingerprint/width all
+    // match, this is a no-op in effect — the existing values are either what
+    // priorDry already captured (resume case) or already stale (discarded
+    // either way by the read above).
+    //
+    // dryCellsWidthByDimension is seeded from the prior map (not started
+    // empty) for the SAME reason dryCellsByDimension is seeded below: a
+    // dimension not yet reached by this run's loop must not vanish from the
+    // persisted snapshot just because an earlier dimension's own persist
+    // fires first.
+    const dryCellsWidthByDimension = { ...priorWidthByDimension };
+    state = patchPhase(state, PHASE_ID, {
+      dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha, dryCellsFingerprint,
+      dryCellsWidthByDimension,
+    });
 
     const passesByDimension = {};
     const packetsByDimension = {};
@@ -944,12 +967,15 @@ export async function run(ctx) {
       // lenses.length, pool member i and i+lenses.length receive the SAME
       // lens (rotation wraps) and thus an IDENTICAL prompt — a fully
       // redundant call that cannot add coverage but still spends budget.
-      const poolWidth = Math.min(charterPoolWidth(dim.weight, poolMax), lenses.length);
+      // (Same value as currentWidthByDimension[dim.id], computed upfront for
+      // the resume-validity check above — reused here as the single source
+      // of truth rather than recomputed.)
+      const poolWidth = currentWidthByDimension[dim.id];
       const dryCells = [];
       let totalPasses = 0;
       for (let pi = 0; pi < packets.length; pi++) {
         if (priorDryForDim.includes(pi)) {
-          dryCells.push(pi); // recorded dry on a prior same-sha run — skip, no finder calls
+          dryCells.push(pi); // recorded dry on a prior same-sha, same-or-wider-width run — skip, no finder calls
           continue;
         }
         const cell = await finderCell(ctx, {
@@ -965,12 +991,14 @@ export async function run(ctx) {
         passesByDimension[dim.id] = totalPasses;
         packetsByDimension[dim.id] = packets.length;
         dryCellsByDimension[dim.id] = dryCells.slice();
-        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax });
+        dryCellsWidthByDimension[dim.id] = poolWidth;
+        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsWidthByDimension });
       }
       passesByDimension[dim.id] = totalPasses;
       packetsByDimension[dim.id] = packets.length;
       dryCellsByDimension[dim.id] = dryCells;
-      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax });
+      dryCellsWidthByDimension[dim.id] = poolWidth;
+      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsWidthByDimension });
     }
 
     const suppressedByDimension = {};
@@ -980,7 +1008,7 @@ export async function run(ctx) {
     });
 
     state = patchPhase(state, PHASE_ID, {
-      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsPoolMax: poolMax,
+      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint, dryCellsWidthByDimension,
       killed, verified: verifiedCount,
     });
     state = addSpend(state, PHASE_ID, llm.drainSpend());

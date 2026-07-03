@@ -658,10 +658,15 @@ test("completion guard, round 3: an EARLY BudgetError (before any per-dimension 
       assert.ok(err instanceof BudgetError, `expected BudgetError, got ${err?.constructor?.name}`);
       assert.ok(err.state, "BudgetError carries state for the resume");
       // The core round-3 assertion: the PERSISTED dry-cell state must NOT
-      // still be run-1's stale full set. It must be empty (nothing yet
-      // recorded for this discarded-and-restarted attempt), not
-      // {security:[0], correctness:[0]} resurrected from run 1.
-      assert.deepEqual(err.state.phases.identify.dryCellsByDimension, {}, "no stale dry-cell data survives the early interruption");
+      // still be run-1's stale full set. Every dimension's recorded-dry list
+      // must be empty (nothing yet recorded for this discarded-and-restarted
+      // attempt) — round 6 changed the shape from a bare {} to an explicit
+      // empty array per dimension (Object.fromEntries over `dims`), but the
+      // meaning is identical: no stale packet index survives.
+      const dryByDim = err.state.phases.identify.dryCellsByDimension;
+      assert.ok(Object.values(dryByDim).every((cells) => cells.length === 0), "no stale dry-cell data survives the early interruption");
+      assert.deepEqual(dryByDim.security, [], "security specifically carries no stale-from-run-1 entries");
+      assert.deepEqual(dryByDim.correctness, [], "correctness specifically carries no stale-from-run-1 entries");
       assert.equal(err.state.phases.identify.dryCellsComplete, false);
       assert.equal(err.state.phases.identify.dryCellsSha, headSha);
       interruptedState = err.state;
@@ -771,13 +776,13 @@ test("dry-cell pool width: a genuine resume with a WIDER --n re-examines cells r
   writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
 
   // Run 1: default width (--n unset -> poolMax 1). Completes, packet 0
-  // recorded dry at width 1, with its fingerprint and poolMax.
+  // recorded dry at width 1, with its fingerprint and per-dimension width.
   const log1 = makeLogFile(t);
   const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
   const result1 = await identify.run(ctx1);
   assert.equal(result1.gate.passed, true);
   assert.deepEqual(result1.state.phases.identify.dryCellsByDimension.security, [0]);
-  assert.equal(result1.state.phases.identify.dryCellsPoolMax, 1);
+  assert.equal(result1.state.phases.identify.dryCellsWidthByDimension.security, 1);
   const stableFingerprint = result1.state.phases.identify.dryCellsFingerprint;
 
   // Hand-construct a genuine INTERRUPTED resume (not a completed run) at the
@@ -795,7 +800,7 @@ test("dry-cell pool width: a genuine resume with a WIDER --n re-examines cells r
         dryCellsByDimension: { security: [0] },
         dryCellsSha: headSha,
         dryCellsFingerprint: stableFingerprint,
-        dryCellsPoolMax: 1, // this interrupted run's own recorded width
+        dryCellsWidthByDimension: { security: 1 }, // this interrupted run's own recorded width
       },
     },
   };
@@ -815,7 +820,7 @@ test("dry-cell pool width: a genuine resume with a WIDER --n re-examines cells r
   assert.equal(calls2.length / passes2, 5, "the re-examination genuinely used the wider width (5, clamped to the lens catalog), not silently narrowed back to 1");
 });
 
-test("dry-cell pool width: state predating this fix (no dryCellsPoolMax field) is treated as the safe historical default of width 1, not silently trusted at a wider resume width", async (t) => {
+test("dry-cell pool width: state predating this fix (no dryCellsWidthByDimension field) is treated as the safe historical default of width 1, not silently trusted at a wider resume width", async (t) => {
   const files = { "a.js": packetSizedFile("MARKER_A") };
   const now = new Date().toISOString();
   const { root, dotdir, headSha } = makeRepo(t, files);
@@ -827,8 +832,8 @@ test("dry-cell pool width: state predating this fix (no dryCellsPoolMax field) i
   assert.equal(result1.gate.passed, true);
   const stableFingerprint = result1.state.phases.identify.dryCellsFingerprint;
 
-  // Simulate state.json written BEFORE this fix shipped: dryCellsPoolMax is
-  // simply absent (the field did not exist), exactly as an upgrade-in-place
+  // Simulate state.json written BEFORE this fix shipped: dryCellsWidthByDimension
+  // is simply absent (the field did not exist), exactly as an upgrade-in-place
   // would look. Every dry cell recorded by pre-fix code was, in fact,
   // produced at the historical default width of 1 (pooling has always been
   // opt-in via --n) — so the undefined fallback must behave AS IF it were 1,
@@ -843,11 +848,11 @@ test("dry-cell pool width: state predating this fix (no dryCellsPoolMax field) i
         dryCellsByDimension: { security: [0] },
         dryCellsSha: headSha,
         dryCellsFingerprint: stableFingerprint,
-        dryCellsPoolMax: undefined,
+        dryCellsWidthByDimension: undefined,
       },
     },
   };
-  delete interruptedState.phases.identify.dryCellsPoolMax;
+  delete interruptedState.phases.identify.dryCellsWidthByDimension;
 
   // Resume at --n 2: if the undefined fallback wrongly assumed a width >= 2
   // (e.g. 2), the cache would be trusted and packet 0 silently skipped even
@@ -860,4 +865,73 @@ test("dry-cell pool width: state predating this fix (no dryCellsPoolMax field) i
 
   const calls2 = readLog(log2).filter((c) => c.label === "finder:security");
   assert.ok(calls2.length > 0, "packet 0 WAS re-examined — pre-fix state with no recorded width is treated as the safe width-1 default, not silently trusted at a wider resume width");
+});
+
+// ---------------------------------------------------------------------------
+// Dry-cell per-dimension weight validity (adversarial review finding, round
+// 6): round 5 gated on a single GLOBAL poolMax, reasoning that comparing it
+// once was equivalent to comparing every dimension's own effective width —
+// true only when no dimension's charter WEIGHT changes. charterPoolWidth
+// depends on BOTH poolMax and dim.weight; weight is independently editable
+// per dimension via charter.md without touching poolMax, source content, or
+// headSha. This test raises ONE dimension's weight (poolMax UNCHANGED)
+// between an interrupted run and its resume, proving the fix is genuinely
+// per-dimension: the reweighted dimension is re-examined, an UNCHANGED
+// dimension is correctly still resumed.
+// ---------------------------------------------------------------------------
+
+test("dry-cell per-dimension weight: raising ONE dimension's charter weight (poolMax unchanged) re-examines only that dimension's stale-width dry cells", async (t) => {
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  // ALL_WEIGHTS already gives security=5, correctness=1 — exactly the base
+  // weights this test needs (security full-width, correctness narrow).
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+  const baseWeights = ALL_WEIGHTS;
+
+  // Run 1 at --n 4: security (weight 5) gets full width 4; correctness
+  // (weight 1) gets width 1. Both dry immediately (empty finder).
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)), n: 4 });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  assert.equal(result1.state.phases.identify.dryCellsWidthByDimension.security, 4);
+  assert.equal(result1.state.phases.identify.dryCellsWidthByDimension.correctness, 1);
+  const stableFingerprint = result1.state.phases.identify.dryCellsFingerprint;
+
+  // Hand-construct a genuine interrupted resume at the SAME recorded widths.
+  const interruptedState = {
+    ...result1.state,
+    phases: {
+      ...result1.state.phases,
+      identify: {
+        ...result1.state.phases.identify,
+        dryCellsComplete: false,
+        dryCellsByDimension: { security: [0], correctness: [0] },
+        dryCellsSha: headSha,
+        dryCellsFingerprint: stableFingerprint,
+        dryCellsWidthByDimension: { security: 4, correctness: 1 },
+      },
+    },
+  };
+
+  // Between the interruption and the resume: raise correctness's weight to
+  // 5 (charter.md edited, uncommitted — headSha and source content both
+  // unchanged). poolMax stays 4 (same --n) — this is the round-6 scenario
+  // exactly: NOT a poolMax change, a WEIGHT change.
+  const raisedWeights = { ...baseWeights, correctness: 5 };
+  artifacts.writeArtifact(dotdir, artifacts.LAYOUT.charter, {
+    meta: { approved: true, headSha, generatedAt: now, intent: "stabilize", weights: raisedWeights },
+    body: "# Charter\n\nPain: stability.\n",
+  });
+
+  const log2 = makeLogFile(t);
+  const ctx2 = makeCtx({ root, dotdir, state: interruptedState, fakeFile: writeFake(t, emptyFinderFake(log2)), n: 4 });
+  const result2 = await identify.run(ctx2);
+  assert.equal(result2.gate.passed, true);
+
+  const correctnessCalls = readLog(log2).filter((c) => c.label === "finder:correctness");
+  const securityCalls = readLog(log2).filter((c) => c.label === "finder:security");
+  assert.ok(correctnessCalls.length > 0, "correctness WAS re-examined — its own weight increase (1->5) correctly discarded its stale width-1 dry-cell entry, even though poolMax never changed");
+  assert.equal(securityCalls.length, 0, "security was NOT re-examined — its weight and width were unchanged, so its dry-cell entry remained correctly trusted (the fix is per-dimension, not a whole-cache invalidation on any weight-map edit)");
 });
