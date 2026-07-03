@@ -376,3 +376,33 @@ test("AC6: at --n 4, per-pass finder call counts are 1 (w1), 2 (w3), 4 (w5)", as
   assert.equal(width("correctness"), 2, "weight 3 → floor(4/2)=2");
   assert.equal(width("performance"), 1, "weight 1 → 1 (no pooling)");
 });
+
+// ---------------------------------------------------------------------------
+// Lens-catalog clamp (adversarial review finding, T2 follow-up): pool width
+// must never exceed the number of available lenses. Beyond that, pool member
+// i and i+lenses.length receive the SAME lens (rotation wraps) and thus an
+// IDENTICAL system prompt — a fully redundant, budget-wasting call.
+// ---------------------------------------------------------------------------
+test("lens-catalog clamp: --n 8 on a weight-5 dimension issues at most 5 calls per pass (the lens catalog size), never 8", async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  const weights = weightsWith({ security: 5 });
+  writeComprehensionInputs(dotdir, headSha, weights);
+  const logFile = newLogFile(t);
+  const ctx = makeCtx(t, { root, dotdir, state: prepState({ headSha, weights }), n: 8, logFile });
+  const res = await identify.run(ctx);
+  assert.equal(res.gate.passed, true);
+
+  const calls = readCalls(logFile).filter((c) => c.label === "finder:security");
+  const passes = res.state.phases.identify.passesByDimension.security;
+  assert.equal(calls.length / passes, 5, "pool width clamps to 5 (the lens catalog size), not the raw --n 8 ceiling");
+
+  // No two calls WITHIN THE SAME PASS may share an identical system prompt —
+  // that would mean two pool members got the same lens (rotation wrapped)
+  // and issued a fully redundant call.
+  const perPass = [];
+  for (let i = 0; i < calls.length; i += 5) perPass.push(calls.slice(i, i + 5));
+  for (const passCalls of perPass) {
+    const systems = new Set(passCalls.map((c) => c.system));
+    assert.equal(systems.size, passCalls.length, "every pooled call in one pass has a distinct system prompt (distinct lens)");
+  }
+});

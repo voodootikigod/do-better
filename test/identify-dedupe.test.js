@@ -201,6 +201,21 @@ test("AC1: a same-dimension+file paraphrase is suppressed; dry streak advances; 
   assert.equal(findings1[0].title, "unvalidated add inputs");
   const id1 = findings1[0].id;
 
+  // Suppression is declared, never silent (adversarial review finding): the
+  // paraphrase's loss must be visible in both the phase summary and the D2
+  // coverage manifest, not just absent from findings/.
+  // Anchored to security's own semicolon-delimited segment ([^;]*) so this
+  // cannot leak into a later dimension's "1 suppressed" text — every OTHER
+  // dimension legitimately shows 0 suppressed here, and an unanchored ".*"
+  // would match across the boundary and pass even if security's own count
+  // were wrong (verified empirically: a mutated suppressed-counter default
+  // of 1 instead of 0 makes every zero-suppression dimension ALSO read
+  // "1 suppressed", and an unanchored regex can't tell them apart).
+  assert.match(result1.summary, /security: \d+ verified \/ \d+ killed \/ 1 suppressed\b[^;]*/, "the phase summary reports the suppression count for security specifically");
+  assert.doesNotMatch(result1.summary, /security: \d+ verified \/ \d+ killed \/ [02-9]\d* suppressed/, "security's suppression count is exactly 1, not 0 or 2+");
+  const manifest = fs.readFileSync(path.join(dotdir, artifacts.LAYOUT.comprehension.coverageManifest), "utf8");
+  assert.match(manifest, /### security[\s\S]*?Semantic suppressions: 1/, "the coverage manifest records the suppression under security's section");
+
   // Re-run: the paraphrase is proposed against the now-VERIFIED prior finding
   // (seeded via readFindings). It must be caught semantically too — no second
   // finding, stable id.

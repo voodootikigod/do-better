@@ -491,3 +491,54 @@ test("AC8: same-sha re-run skips recorded-dry packets and resumes the non-dry on
   const finder3 = readLog(log3).filter((c) => c.label === "finder:security").map((c) => c.prompt);
   assert.ok(finder3.some((p) => p.includes("MARKER_A")), "a sha change re-examines the previously-dry packet A");
 });
+
+// ---------------------------------------------------------------------------
+// Completion guard (adversarial review finding, T1 follow-up): persisted
+// dry-cell state must be honored ONLY when the prior identify run did NOT
+// complete successfully at this sha. A deliberate re-audit after a SUCCESSFUL
+// run (e.g. widening --n to search harder) must re-examine everything, not
+// silently skip cells whose dryness was only ever verified at the OLD width.
+// ---------------------------------------------------------------------------
+
+test("completion guard: a same-sha re-run AFTER A SUCCESSFUL identify does NOT skip any packet as recorded-dry", async (t) => {
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+
+  // Run 1: everything dries immediately with zero candidates → gate PASSES,
+  // status becomes "done", and dryCellsByDimension.security is populated
+  // (packet 0 recorded dry) at this exact headSha.
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  assert.equal(result1.state.phases.identify.status, "done", "the prior run completed successfully");
+  assert.deepEqual(result1.state.phases.identify.dryCellsByDimension.security, [0], "packet 0 recorded dry on the successful run");
+  assert.equal(result1.state.phases.identify.dryCellsSha, headSha);
+
+  // Run 2: SAME sha, SAME state carried forward (as `do-better audit` would
+  // do — it always loads persisted state.json and calls identify.run
+  // unconditionally, with no check for prior completion). A NEW fake this
+  // time returns a genuinely new candidate and logs every finder call it
+  // receives. Before the completion guard, run 2 would skip packet 0
+  // entirely (dryCellsSha === headSha) and issue ZERO finder calls for it,
+  // regardless of what a wider --n or a deliberate re-audit intended.
+  const log2 = makeLogFile(t);
+  const freshCandidateFake = [
+    'import fs from "node:fs";',
+    `const logFile = ${JSON.stringify(log2)};`,
+    "export default async function fake({ prompt = '', label = '', jsonMode }) {",
+    "  fs.appendFileSync(logFile, JSON.stringify({ label, prompt }) + '\\n');",
+    "  if (label.includes('finder')) return '{\"candidates\":[]}';",
+    "  if (label.includes('verdict')) return '{\"verdict\":\"KILL\"}';",
+    "  return '{\"reproCmd\":null}';",
+    "}",
+  ].join("\n");
+  const ctx2 = makeCtx({ root, dotdir, state: result1.state, fakeFile: writeFake(t, freshCandidateFake) });
+  const result2 = await identify.run(ctx2);
+  assert.equal(result2.gate.passed, true);
+
+  const finder2 = readLog(log2).filter((c) => c.label === "finder:security").map((c) => c.prompt);
+  assert.ok(finder2.some((p) => p.includes("MARKER_A")), "packet A WAS re-queried on the fresh audit — the stale dry-cell state from the completed run was correctly discarded, not silently honored");
+});
