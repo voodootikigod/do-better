@@ -139,7 +139,7 @@ function makeLogFile(t) {
   return path.join(dir, "calls.jsonl");
 }
 
-function makeCtx({ root, dotdir, state, fakeFile = null, offline = false, budget = null }) {
+function makeCtx({ root, dotdir, state, fakeFile = null, offline = false, budget = null, n = null }) {
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY; delete env.OPENAI_API_KEY; delete env.GEMINI_API_KEY;
   delete env.DOBETTER_FAKE_LLM;
@@ -147,7 +147,7 @@ function makeCtx({ root, dotdir, state, fakeFile = null, offline = false, budget
   const flags = {
     command: "audit", target: root, provider: null, budget, offline,
     modelCheap: "claude-haiku-4-5", modelMid: "claude-sonnet-4-6", modelFrontier: "claude-opus-4-8",
-    n: null, threshold: null, approve: false, yes: false, json: false, help: false,
+    n, threshold: null, approve: false, yes: false, json: false, help: false,
   };
   const llm = llmMod.createLLM({ flags, state, env });
   return {
@@ -752,4 +752,65 @@ test("dry-cell fingerprint: a same-sha resume with an uncommitted content edit r
 
   const finder2 = readLog(log2).filter((c) => c.label === "finder:security").map((c) => c.prompt);
   assert.ok(finder2.some((p) => p.includes("MARKER_B")), "the edited content WAS shown to a finder — the fingerprint mismatch correctly discarded the stale positional dry-cell index, despite dryCellsComplete:false and a matching sha (which alone would have honored the stale index)");
+});
+
+// ---------------------------------------------------------------------------
+// Dry-cell pool-width validity (adversarial review finding, round 5): the
+// completion guard (round 1) closed the "a cell recorded dry at a narrower
+// --n is trusted after widening --n" gap only for a SUCCESSFULLY COMPLETED
+// prior run (dryCellsComplete:true forces full re-examination). The equally
+// realistic interrupted/failed-run resume path — the path the dry-cell cache
+// exists to serve — remained unguarded: sha+fingerprint alone say nothing
+// about how many lenses were fanned over a cell before it was declared dry.
+// ---------------------------------------------------------------------------
+
+test("dry-cell pool width: a genuine resume with a WIDER --n re-examines cells recorded dry at a narrower width", async (t) => {
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+
+  // Run 1: default width (--n unset -> poolMax 1). Completes, packet 0
+  // recorded dry at width 1, with its fingerprint and poolMax.
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  assert.deepEqual(result1.state.phases.identify.dryCellsByDimension.security, [0]);
+  assert.equal(result1.state.phases.identify.dryCellsPoolMax, 1);
+  const stableFingerprint = result1.state.phases.identify.dryCellsFingerprint;
+
+  // Hand-construct a genuine INTERRUPTED resume (not a completed run) at the
+  // SAME width, sha, and content — isolating the width check from the
+  // completion guard, exactly as the round-4 test isolates the fingerprint
+  // check (a completed-run resume would re-examine everything regardless,
+  // making the width check's own effect unobservable).
+  const interruptedState = {
+    ...result1.state,
+    phases: {
+      ...result1.state.phases,
+      identify: {
+        ...result1.state.phases.identify,
+        dryCellsComplete: false,
+        dryCellsByDimension: { security: [0] },
+        dryCellsSha: headSha,
+        dryCellsFingerprint: stableFingerprint,
+        dryCellsPoolMax: 1, // this interrupted run's own recorded width
+      },
+    },
+  };
+
+  // Resume with a WIDER --n (8, clamped to the 5-lens catalog for weight-5
+  // security). Without the width check, packet 0 would be skipped as
+  // "recorded dry" and the wider fan-out the user explicitly asked for would
+  // never touch it.
+  const log2 = makeLogFile(t);
+  const ctx2 = makeCtx({ root, dotdir, state: interruptedState, fakeFile: writeFake(t, emptyFinderFake(log2)), n: 8 });
+  const result2 = await identify.run(ctx2);
+  assert.equal(result2.gate.passed, true);
+
+  const calls2 = readLog(log2).filter((c) => c.label === "finder:security");
+  assert.ok(calls2.length > 0, "packet 0 WAS re-examined at the wider width — the narrower-recorded pool width correctly discarded the stale dry-cell index");
+  const passes2 = result2.state.phases.identify.passesByDimension.security;
+  assert.equal(calls2.length / passes2, 5, "the re-examination genuinely used the wider width (5, clamped to the lens catalog), not silently narrowed back to 1");
 });
