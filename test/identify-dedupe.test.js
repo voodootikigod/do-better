@@ -201,6 +201,13 @@ test("AC1: a same-dimension+file paraphrase is suppressed; dry streak advances; 
   assert.equal(findings1[0].title, "unvalidated add inputs");
   const id1 = findings1[0].id;
 
+  // Suppression is declared, never silent (adversarial review finding): the
+  // paraphrase's loss must be visible in both the phase summary and the D2
+  // coverage manifest, not just absent from findings/.
+  assert.match(result1.summary, /security:.*1 suppressed/, "the phase summary reports the suppression count per dimension");
+  const manifest = fs.readFileSync(path.join(dotdir, artifacts.LAYOUT.comprehension.coverageManifest), "utf8");
+  assert.match(manifest, /### security[\s\S]*?Semantic suppressions: 1/, "the coverage manifest records the suppression under security's section");
+
   // Re-run: the paraphrase is proposed against the now-VERIFIED prior finding
   // (seeded via readFindings). It must be caught semantically too — no second
   // finding, stable id.

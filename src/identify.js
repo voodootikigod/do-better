@@ -591,17 +591,22 @@ async function isSemanticDuplicate(ctx, cand, priorSameCell) {
 // ---------------------------------------------------------------------------
 const D2_COVERAGE_HEADING = "## D2 finder coverage";
 
-function d2CoverageSection({ dims, offline, passesByDimension, packetsByDimension, examinedFiles, truncatedFiles, unreadableFiles }) {
+function d2CoverageSection({ dims, offline, passesByDimension, packetsByDimension, suppressedByDimension, examinedFiles, truncatedFiles, unreadableFiles }) {
   const examinedTxt = examinedFiles.length ? examinedFiles.join(", ") : "(none)";
   const truncatedTxt = truncatedFiles.length ? truncatedFiles.join(", ") : "(none)";
   const lines = [D2_COVERAGE_HEADING, ""];
   for (const dim of dims) {
     const packets = packetsByDimension[dim.id] ?? 0;
     const passes = passesByDimension[dim.id] ?? 0;
+    const suppressed = suppressedByDimension?.[dim.id] ?? 0;
     lines.push(`### ${dim.id}`);
     lines.push(`- Files examined: ${examinedTxt}`);
     lines.push(`- Packets: ${packets}${offline ? " (offline — no packetization)" : ""}`);
     lines.push(`- Total passes: ${passes}`);
+    // T3 semantic suppressions — declared, never silent (adversarial review
+    // finding: a false-duplicate permanently loses a real finding, and that
+    // outcome was previously invisible anywhere in the run's output).
+    lines.push(`- Semantic suppressions: ${suppressed}`);
     lines.push(`- Truncated slices: ${truncatedTxt}`);
     lines.push("");
   }
@@ -649,6 +654,7 @@ function writeD2Coverage(dotdir, data) {
 async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, lenses, poolWidth, taxonomyDoc }) {
   const { llm, log } = ctx;
   const newCands = [];
+  let suppressed = 0;
   let dryStreak = 0;
   let pass = 0;
   while (pass < MAX_PASSES && dryStreak < K_DRY) {
@@ -698,6 +704,12 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, 
             .filter((p) => p.dimension === cand.dimension && p.file === cand.file);
           if (await isSemanticDuplicate(ctx, cand, priorSameCell)) {
             seen.add(key);
+            // Declared, never silent (adversarial review finding): a
+            // semantic suppression is the one outcome the fail-open doctrine
+            // calls "permanently loses a finding nothing downstream can
+            // resurrect" — it must be as visible as a killed candidate.
+            suppressed += 1;
+            log?.substep?.(`suppressed [${dim.id}] "${cand.title}" — judged a semantic duplicate in ${cand.file}`);
             continue;
           }
         }
@@ -709,7 +721,7 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, 
     }
     dryStreak = newCount === 0 ? dryStreak + 1 : 0;
   }
-  return { passes: pass, dry: dryStreak >= K_DRY, newCands };
+  return { passes: pass, dry: dryStreak >= K_DRY, newCands, suppressed };
 }
 
 // ---------------------------------------------------------------------------
@@ -763,8 +775,23 @@ export async function run(ctx) {
     // (resuming after a BudgetError before the next phase pins a new sha),
     // packets already recorded dry are skipped — zero finder calls reissued. A
     // sha change discards this entirely (full re-examination).
+    //
+    // Completion guard (adversarial review finding): dry-cell state is only
+    // honored when the PRIOR identify run did NOT complete successfully at
+    // this sha — i.e. this is a genuine resume after a BudgetError or a
+    // not-dry gate failure, both of which record status "failed" (or leave
+    // it at defaultState's "pending") rather than "done". Without this guard,
+    // re-running `audit` at the same commit right after a SUCCESSFUL identify
+    // — e.g. deliberately widening --n to search harder — silently skipped
+    // every already-dry cell regardless of the new width, reporting them as
+    // examined using the OLD narrower pool data. A completed run's dry-cell
+    // state is "spent"; any later invocation at the same sha is a deliberate
+    // fresh audit and must re-examine everything.
     const priorIdentify = state?.phases?.identify ?? {};
-    const priorDry = priorIdentify.dryCellsSha === headSha ? (priorIdentify.dryCellsByDimension ?? {}) : {};
+    const priorDone = priorIdentify.status === "done";
+    const priorDry = !priorDone && priorIdentify.dryCellsSha === headSha
+      ? (priorIdentify.dryCellsByDimension ?? {})
+      : {};
 
     const passesByDimension = {};
     const packetsByDimension = {};
@@ -816,7 +843,7 @@ export async function run(ctx) {
     };
 
     for (const dim of dims) {
-      counts[dim.id] = { verified: 0, killed: 0 };
+      counts[dim.id] = { verified: 0, killed: 0, suppressed: 0 };
 
       if (offline) {
         const pool = [];
@@ -837,7 +864,11 @@ export async function run(ctx) {
       const pool = [];
       const priorFixed = priorByDim[dim.id] ?? [];
       const priorDryForDim = priorDry[dim.id] ?? [];
-      const poolWidth = charterPoolWidth(dim.weight, poolMax);
+      // Clamp to the lens catalog size (adversarial review finding): beyond
+      // lenses.length, pool member i and i+lenses.length receive the SAME
+      // lens (rotation wraps) and thus an IDENTICAL prompt — a fully
+      // redundant call that cannot add coverage but still spends budget.
+      const poolWidth = Math.min(charterPoolWidth(dim.weight, poolMax), lenses.length);
       const dryCells = [];
       let totalPasses = 0;
       for (let pi = 0; pi < packets.length; pi++) {
@@ -849,6 +880,7 @@ export async function run(ctx) {
           dim, packetText: packets[pi].packet, pool, priorFixed, seen, base: refuteBase, lenses, poolWidth, taxonomyDoc,
         });
         totalPasses += cell.passes;
+        counts[dim.id].suppressed += cell.suppressed;
         if (cell.dry) dryCells.push(pi);
         else notDry.push({ dim: dim.id, packet: pi });
         await verifyAndRecord(dim.id, cell.newCands);
@@ -865,8 +897,10 @@ export async function run(ctx) {
       state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha });
     }
 
+    const suppressedByDimension = {};
+    for (const dim of dims) suppressedByDimension[dim.id] = counts[dim.id]?.suppressed ?? 0;
     writeD2Coverage(dotdir, {
-      dims, offline, passesByDimension, packetsByDimension, examinedFiles, truncatedFiles, unreadableFiles,
+      dims, offline, passesByDimension, packetsByDimension, suppressedByDimension, examinedFiles, truncatedFiles, unreadableFiles,
     });
 
     state = patchPhase(state, PHASE_ID, {
@@ -890,7 +924,7 @@ export async function run(ctx) {
     state = pinSha(state, PHASE_ID, headSha);
 
     const perDim = dims
-      .map((d) => `${d.id}: ${counts[d.id].verified} verified / ${counts[d.id].killed} killed (${passesByDimension[d.id]} pass${passesByDimension[d.id] === 1 ? "" : "es"})`)
+      .map((d) => `${d.id}: ${counts[d.id].verified} verified / ${counts[d.id].killed} killed / ${counts[d.id].suppressed} suppressed (${passesByDimension[d.id]} pass${passesByDimension[d.id] === 1 ? "" : "es"})`)
       .join("; ");
     const summary =
       `Identify complete @ ${head7}: every (dimension × packet) cell ran dry (K=${K_DRY}); ${verifiedCount} finding(s) verified, ${killed} killed, 0 unverified written. ` +
