@@ -266,6 +266,26 @@ function loadSlices(root, files) {
   return slices;
 }
 
+// Content fingerprint over the ordered, readable deep-read set (adversarial
+// review finding, round 4): the dry-cell resume cache below is keyed on
+// headSha, but packet identity is POSITIONAL and content is read from the
+// WORKING TREE, not the committed blob. Two things can change while headSha
+// stays constant — file content (a budget-stop resume is precisely the flow
+// where uncommitted edits are live) and the file SET/order (`audit` always
+// re-runs D1 comprehend before D2, which can regenerate a different deep-read
+// list). Either shift silently invalidates a positional index -> packet
+// mapping: a recorded-dry packet 0 could be entirely different files/content
+// on resume. This fingerprint changes on ANY such drift, so the completion
+// guard can invalidate the WHOLE dry-cell cache (full re-examination) rather
+// than trusting a positional index against content it never actually
+// verified. Whole-set invalidation, not per-packet reconciliation: simpler
+// and safe — the failure mode of over-invalidating is one extra pass, not a
+// silently unaudited file.
+function packetSetFingerprint(slices) {
+  const parts = slices.map((s) => `${s.file}:${sha256Hex(s.raw)}`);
+  return sha256Hex(parts.join("|"));
+}
+
 // One slice → its numbered, file-delimited chunk (the unit of packetization).
 function renderSlice(s) {
   const numbered = s.raw.split("\n").map((l, i) => `${i + 1}: ${l}`).join("\n");
@@ -751,6 +771,7 @@ export async function run(ctx) {
     const examinedFiles = slices.map((s) => s.file);
     const unreadableFiles = declaredFiles.filter((f) => !examinedFiles.includes(f));
     const truncatedFiles = slices.filter((s) => renderSlice(s).length > PACKET_BYTES).map((s) => s.file);
+    const dryCellsFingerprint = packetSetFingerprint(slices);
 
     // Partition the whole readable set into packets (online only); offline runs
     // a single deterministic static pass and does not consume packets.
@@ -797,7 +818,17 @@ export async function run(ctx) {
     // interrupted run's incremental patches always persist it as false.
     const priorIdentify = state?.phases?.identify ?? {};
     const priorComplete = priorIdentify.dryCellsComplete === true;
-    const priorDry = !priorComplete && priorIdentify.dryCellsSha === headSha
+    // Honored only when the commit sha AND the content fingerprint both
+    // match (round-4 adversarial review finding): sha alone is not enough —
+    // packet identity is positional and content is read from the working
+    // tree, so uncommitted edits or a regenerated deep-read list (D1
+    // comprehend re-runs on every `audit`) can shift what a positional index
+    // refers to while headSha stays constant. Any drift in the fingerprint
+    // invalidates the WHOLE cache — see packetSetFingerprint's comment for
+    // why whole-set invalidation, not per-packet reconciliation.
+    const priorDry = !priorComplete
+      && priorIdentify.dryCellsSha === headSha
+      && priorIdentify.dryCellsFingerprint === dryCellsFingerprint
       ? (priorIdentify.dryCellsByDimension ?? {})
       : {};
     // Reset for THIS run — and this must clear the PERSISTED dry-cell data
@@ -811,14 +842,14 @@ export async function run(ctx) {
     // stale set alongside dryCellsComplete:false, and the next resume
     // honored it as if it were THIS run's own progress, silently skipping
     // cells the re-audit existed to re-examine). Clearing
-    // dryCellsByDimension/dryCellsSha here, in the SAME patch, means an
-    // early interruption's persisted state truthfully shows "nothing
-    // recorded yet for this attempt" rather than resurrecting stale data.
-    // When priorComplete is false (a genuine resume) or the sha changed,
-    // this is a no-op in effect — the existing values are either what
-    // priorDry already captured (resume case) or already stale by sha
-    // mismatch (discarded either way by the read above).
-    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha });
+    // dryCellsByDimension/dryCellsSha/dryCellsFingerprint here, in the SAME
+    // patch, means an early interruption's persisted state truthfully shows
+    // "nothing recorded yet for this attempt" rather than resurrecting stale
+    // data. When priorComplete is false (a genuine resume) and both the sha
+    // and fingerprint match, this is a no-op in effect — the existing values
+    // are either what priorDry already captured (resume case) or already
+    // stale (discarded either way by the read above).
+    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha, dryCellsFingerprint });
 
     const passesByDimension = {};
     const packetsByDimension = {};
@@ -923,12 +954,12 @@ export async function run(ctx) {
         passesByDimension[dim.id] = totalPasses;
         packetsByDimension[dim.id] = packets.length;
         dryCellsByDimension[dim.id] = dryCells.slice();
-        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha });
+        state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint });
       }
       passesByDimension[dim.id] = totalPasses;
       packetsByDimension[dim.id] = packets.length;
       dryCellsByDimension[dim.id] = dryCells;
-      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha });
+      state = patchPhase(state, PHASE_ID, { passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint });
     }
 
     const suppressedByDimension = {};
@@ -938,7 +969,7 @@ export async function run(ctx) {
     });
 
     state = patchPhase(state, PHASE_ID, {
-      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha,
+      passesByDimension, packetsByDimension, dryCellsByDimension, dryCellsSha: headSha, dryCellsFingerprint,
       killed, verified: verifiedCount,
     });
     state = addSpend(state, PHASE_ID, llm.drainSpend());
