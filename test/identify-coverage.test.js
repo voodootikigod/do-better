@@ -542,3 +542,68 @@ test("completion guard: a same-sha re-run AFTER A SUCCESSFUL identify does NOT s
   const finder2 = readLog(log2).filter((c) => c.label === "finder:security").map((c) => c.prompt);
   assert.ok(finder2.some((p) => p.includes("MARKER_A")), "packet A WAS re-queried on the fresh audit — the stale dry-cell state from the completed run was correctly discarded, not silently honored");
 });
+
+// ---------------------------------------------------------------------------
+// Completion guard, round 2 (adversarial review finding): the guard must be
+// keyed on a DEDICATED dryCellsComplete marker, not phase `status` — a
+// BudgetError never calls recordPhase, so `status` keeps whatever value it
+// had BEFORE the interrupted run started. A status-keyed guard therefore
+// breaks the exact case it exists to protect: complete a run (status "done")
+// -> deliberately re-audit (correctly resets and starts fresh) -> THAT
+// re-audit is interrupted mid-flight, persisting its own incremental
+// dry-cell progress -> status is STILL "done" (untouched by the
+// interruption) -> a status-keyed guard wrongly reads that stale "done" as
+// "already complete" and discards the interrupted run's own progress on
+// every subsequent resume attempt, never converging under a tight budget.
+// ---------------------------------------------------------------------------
+
+test("completion guard, round 2: an interrupted re-audit's OWN dry-cell progress is honored on resume, even though phase status is stale 'done' from the PRIOR completed run", async (t) => {
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+
+  // Run 1: completes successfully, exactly as in the test above.
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  assert.equal(result1.state.phases.identify.status, "done");
+  assert.equal(result1.state.phases.identify.dryCellsComplete, true, "completion marker set on genuine success");
+
+  // Simulate the exact interruption scenario: a fresh re-audit was
+  // dispatched from result1.state (as `do-better audit` genuinely does —
+  // unconditionally, per bin/cli.js), it reset dryCellsComplete to false at
+  // its own start, made SOME progress of its own (persisted incrementally,
+  // mid-loop, exactly as identify.run's patchPhase calls do), and then was
+  // interrupted by something that bypasses recordPhase entirely (a
+  // BudgetError propagates straight through the outer catch, which only
+  // attaches spend — it never touches `status`). The result: `status` is
+  // STILL "done" from run 1 (never rewritten), but `dryCellsComplete` is
+  // correctly false, and `dryCellsByDimension`/`dryCellsSha` reflect this
+  // interrupted run's OWN progress, not run 1's.
+  const interruptedState = {
+    ...result1.state,
+    phases: {
+      ...result1.state.phases,
+      identify: {
+        ...result1.state.phases.identify,
+        status: "done", // stale — untouched by the interruption, exactly the bug condition
+        dryCellsComplete: false, // correctly reset at the interrupted run's own start
+        dryCellsByDimension: { security: [0] }, // this interrupted run's own progress
+        dryCellsSha: headSha,
+      },
+    },
+  };
+
+  // Resume: a fresh fake logs every finder call it receives. If the guard
+  // wrongly trusts stale `status === "done"`, it discards the interrupted
+  // run's progress and packet A gets re-queried. The fix must NOT do that.
+  const log2 = makeLogFile(t);
+  const ctx2 = makeCtx({ root, dotdir, state: interruptedState, fakeFile: writeFake(t, emptyFinderFake(log2)) });
+  const result2 = await identify.run(ctx2);
+  assert.equal(result2.gate.passed, true);
+
+  const finder2 = readLog(log2).filter((c) => c.label === "finder:security").map((c) => c.prompt);
+  assert.equal(finder2.length, 0, "packet A was NOT re-queried — the interrupted run's own dry-cell progress was honored on resume, despite stale status:\"done\" from the earlier completed run");
+});

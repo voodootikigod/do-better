@@ -776,22 +776,34 @@ export async function run(ctx) {
     // packets already recorded dry are skipped — zero finder calls reissued. A
     // sha change discards this entirely (full re-examination).
     //
-    // Completion guard (adversarial review finding): dry-cell state is only
-    // honored when the PRIOR identify run did NOT complete successfully at
-    // this sha — i.e. this is a genuine resume after a BudgetError or a
-    // not-dry gate failure, both of which record status "failed" (or leave
-    // it at defaultState's "pending") rather than "done". Without this guard,
-    // re-running `audit` at the same commit right after a SUCCESSFUL identify
-    // — e.g. deliberately widening --n to search harder — silently skipped
-    // every already-dry cell regardless of the new width, reporting them as
-    // examined using the OLD narrower pool data. A completed run's dry-cell
-    // state is "spent"; any later invocation at the same sha is a deliberate
-    // fresh audit and must re-examine everything.
+    // Completion guard, keyed on a DEDICATED marker, not phase `status`
+    // (adversarial review finding, round 2 — a `status`-keyed guard has its
+    // own bug): dry-cell state is only honored when the prior run's
+    // `dryCellsComplete` flag is not true — i.e. this is a genuine resume
+    // after a BudgetError or a not-dry gate failure, never a run that
+    // actually finished. `status` is unsuitable for this because a
+    // BudgetError never calls recordPhase — it propagates straight through
+    // the outer catch, which only attaches spend, so `status` keeps
+    // whatever value it had BEFORE this run started. A guard keyed on
+    // `status === "done"` therefore breaks exactly the case it exists to
+    // protect: complete a run (status "done") → deliberately re-audit
+    // (correctly discards stale dry state) → that re-audit hits a
+    // BudgetError mid-loop → `status` is STILL "done" (never touched by the
+    // interruption) → the next resume wrongly discards the dry-cell
+    // progress THIS interrupted run just persisted, restarting from zero
+    // forever under a tight budget. `dryCellsComplete` avoids this: it is
+    // explicitly reset to false at the top of every run (below) and is set
+    // true ONLY at the actual successful-completion point, so an
+    // interrupted run's incremental patches always persist it as false.
     const priorIdentify = state?.phases?.identify ?? {};
-    const priorDone = priorIdentify.status === "done";
-    const priorDry = !priorDone && priorIdentify.dryCellsSha === headSha
+    const priorComplete = priorIdentify.dryCellsComplete === true;
+    const priorDry = !priorComplete && priorIdentify.dryCellsSha === headSha
       ? (priorIdentify.dryCellsByDimension ?? {})
       : {};
+    // Reset for THIS run: until identify actually finishes successfully
+    // below, dryCellsComplete stays false, so any interruption (BudgetError
+    // or a not-dry gate failure) leaves a truthfully-resumable marker behind.
+    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false });
 
     const passesByDimension = {};
     const packetsByDimension = {};
@@ -922,6 +934,10 @@ export async function run(ctx) {
     state = setGate(state, "identify", { passed: true, dryPassesByDimension: passesByDimension, packetsByDimension, unverified: 0 });
     state = recordPhase(state, PHASE_ID, { status: "done", sha: headSha, now: now() });
     state = pinSha(state, PHASE_ID, headSha);
+    // Mark dry-cell state complete ONLY here, at genuine successful
+    // completion — this is what the completion guard above checks, not
+    // `status` (see the comment there for why `status` alone is unsafe).
+    state = patchPhase(state, PHASE_ID, { dryCellsComplete: true });
 
     const perDim = dims
       .map((d) => `${d.id}: ${counts[d.id].verified} verified / ${counts[d.id].killed} killed / ${counts[d.id].suppressed} suppressed (${passesByDimension[d.id]} pass${passesByDimension[d.id] === 1 ? "" : "es"})`)
