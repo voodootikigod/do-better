@@ -233,11 +233,24 @@ same context: **finders** propose, **verifiers** kill.
    (titles + files pool-wide across the dimension's packets, never transcripts —
    a finding from packet 1 is never re-proposed against packet 3).
 2. **Loop each (dimension × packet) cell until dry**: a pass with zero new
-   candidates (deduped on dimension + file + normalized claim) is dry; stop at
-   K=2 consecutive dry passes; a cell not dry within 8 passes fails the gate
-   (the failure detail names the dimension AND the packet). An empty/unreadable
-   deep-read set online is a gate failure too — starvation is never a silent
-   zero-finding pass. Packets that reached K=2 are recorded per head sha, so a
+   candidates is dry; stop at K=2 consecutive dry passes; a cell not dry within
+   8 passes fails the gate (the failure detail names the dimension AND the
+   packet). Admission is **two-layered**: (a) a free hash filter on
+   dimension + file + normalized claim rejects verbatim repeats; (b) online
+   only, each hash-survivor then faces a **cheap-tier semantic check** —
+   one `dedupe` call comparing it against prior admitted entries (this run's
+   pool **and** prior verified findings, D6) that share the same dimension AND
+   file, so a re-worded restatement the hash cannot see is suppressed (it does
+   not join the pool, does not become a finding, and does not count as "new" for
+   the dry streak, but its hash key is recorded so it is not re-litigated). This
+   semantic check is the **one sanctioned FAIL-OPEN path** in D2: an
+   unparseable response, an out-of-range index, or a network/parse error admits
+   the candidate as if new. Every other failure in D2 fails closed; this one
+   inverts deliberately, because a false-new costs only one wasted verification
+   call (which kills genuine junk anyway) while a false-duplicate permanently
+   loses a finding nothing downstream can resurrect. Offline runs skip layer (b)
+   entirely — hash-only, unchanged. An empty/unreadable deep-read set online is
+   a gate failure too — starvation is never a silent zero-finding pass. Packets that reached K=2 are recorded per head sha, so a
    same-sha resume (after a `--budget` stop) skips them with zero re-issued
    finder calls; a sha change discards that state and re-examines everything.
    After the loop, a **`## D2 finder coverage`** section is written idempotently
