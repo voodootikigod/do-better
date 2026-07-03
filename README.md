@@ -97,10 +97,24 @@ npx do-better refresh     # idempotent re-run; diffs vs pinned SHA; only changed
 | `--model-cheap <id>` / `--model-mid <id>` / `--model-frontier <id>` | all | Override the model for one tier (see Model tiering). |
 | `--target <dir>` | all | Target repo (also the second positional). Default `.`. |
 | `--approve` | `charter`, `roadmap` | Approve the human-gated artifact as it stands on disk (post-edit hashes are recorded, not rejected). |
-| `--n <N>` / `--threshold <t>` | `audit` | Parallax fan width (default 3) / divergence threshold (default 0.25). |
+| `--n <N>` / `--threshold <t>` | `audit` | D1 parallax fan width (default 3) **and** the D2 finder-pool ceiling / divergence threshold (default 0.25). In D2, `--n` caps a charter-weighted pool of distinct-lens finders (table below); unset, the D2 pool ceiling is 1 (pooling opt-in). |
 | `--yes` | `rail`, others | Skip confirmations (e.g. the rails commit). Never skips the two human gates. |
 | `--json` | all | Machine-readable summary on stdout. |
 | `-h`, `--help` | all | Help. |
+
+**D2 charter-weighted finder-pool width.** `--n` is the ceiling; each pass fans
+that many finders, each under a distinct lens, so "dry" means the codebase is
+exhausted rather than that a single context converged:
+
+| Charter weight | Effective pool width |
+|---|---|
+| 4–5 | `--n` (full width) |
+| 2–3 | `max(1, floor(--n / 2))` |
+| 1 | `1` (no pooling) |
+
+`--n 1` reproduces the pre-pool single-finder call counts exactly (every
+dimension is width 1). Unset, the D2 ceiling is 1; lens rotation across passes
+is always on, while the within-pass fan-out is opt-in via `--n`.
 
 ### Exit codes
 
@@ -110,7 +124,37 @@ The adlc-universal contract:
 |---|---|
 | `0` | Success — **including a clean human-gate pause** with printed resume instructions. |
 | `1` | Operational error: bad input, missing file, no provider/key, network or LLM failure after retries, budget exceeded. |
-| `2` | Deterministic gate failure: divergence over threshold, dimension not dry / unverified findings, coldstart gaps unrepaired, rails red, hollow-audit survivor. |
+| `2` | Deterministic gate failure: divergence over threshold, a `(dimension × packet)` cell not dry / unverified findings, coldstart gaps unrepaired, rails red, hollow-audit survivor. |
+
+### D2 coverage & sizing `--budget`
+
+D2 no longer rotates a single ≤30 KB window over the deep-read set — it
+**partitions the whole set into packets** (every deep-read file lands in exactly
+one packet; an oversized file becomes its own truncated singleton) and loops
+each `(dimension × packet)` cell until dry. That guarantees every deep-read byte
+is actually shown to a finder, but it also means finder calls scale with the
+number of packets. After a run, `.dobetter/comprehension/coverage-manifest.md`
+gains a **`## D2 finder coverage`** section recording, per dimension, the files
+examined, packet count, total passes, and any truncated slices (unreadable
+files land under `### Unexamined`).
+
+Finder calls scale as **`dimensions × packets × passes × N`**, so size
+`--budget` before a run. For a reference repo of ~8 dimensions and ~5 packets,
+with the dry loop settling near its `K_DRY = 2` floor (best case) and its
+`MAX_PASSES = 8` cap (worst case):
+
+| Term | Value | Notes |
+|---|---|---|
+| dimensions | 8 | taxonomy floor (+ any charter extras) |
+| packets | ~5 | reference shape; grows with deep-read size / file size |
+| passes per cell | 2 – 8 | `K_DRY = 2` when a cell settles immediately; `MAX_PASSES = 8` cap |
+| N | `poolN` | finder pool width per pass — a variable here; charter-weighted pooling lands in T2 |
+| **finder calls** | **80·N – 320·N** | `8 × 5 × {2‥8} × N`; verification adds ≤1 repro + ≤1 verdict per surviving candidate |
+
+`--budget` is the hard ceiling: a call that would exceed it refuses and stops
+with resume instructions, and every finding verified so far is already on disk
+(findings are written per candidate, not batched). A same-sha resume skips the
+packets already recorded dry — zero re-issued finder calls for them.
 
 ### Environment variables
 

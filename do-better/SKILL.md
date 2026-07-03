@@ -93,9 +93,25 @@ CLI flags (manual mode: treat each as an instruction you honor by hand):
 | `--model-cheap / --model-mid / --model-frontier <id>` | Override one tier's model (see Model tiering). | Model names are validated; shell-metacharacter names are rejected. |
 | `--target <dir>` (or 2nd positional) | Target repo. Default `.`. | Must be a git repository — claims are SHA-pinned, so no git means no run. |
 | `--approve` | (`charter`, `roadmap`) Approve the human-gated artifact as it now stands on disk. | Approval re-validates: charter must satisfy the taxonomy floor; roadmap requires a clean coldstart gate. |
-| `--n <N>` / `--threshold <t>` | (`audit`) Parallax fan width / divergence threshold. Defaults 3 / 0.25. | Divergence ≥ threshold fails the gate (exit 2) — it is a finding about confusion, not noise to ignore. |
+| `--n <N>` / `--threshold <t>` | (`audit`) D1 parallax fan width (default 3) **and** the D2 finder-pool ceiling / divergence threshold (default 0.25). | Divergence ≥ threshold fails the gate (exit 2) — it is a finding about confusion, not noise to ignore. In D2, `--n` is the *maximum* pool width; the effective width is charter-weighted (table below), so a low-weight dimension never over-fans. Unset, the D2 pool ceiling is **1** (pooling is opt-in; lens rotation across passes is always on). |
 | `--yes` | Skip confirmations (e.g. the D4 rails commit). | Never skips the two human gates — those have no bypass flag, by design. |
 | `--json` | Machine summary on stdout. | — |
+
+**D2 charter-weighted pool width** (fan `N` distinct-lens finders per pass, so
+"dry" means the codebase is exhausted, not that one context converged). Given
+`--n` as the ceiling:
+
+| Charter weight | Effective pool width |
+|---|---|
+| 4–5 | `--n` (full width) |
+| 2–3 | `max(1, floor(--n / 2))` |
+| 1 | `1` (no pooling — identical to the single-finder pre-pool behavior) |
+
+At `--n 1` every dimension is width 1 regardless of weight (`min(1, …) = 1`),
+reproducing the pre-pool single-finder call counts exactly. Each pooled call
+sees the refute charter plus exactly one lens
+([references/refute-charter.md](references/refute-charter.md) `## Lenses`) —
+never the catalog, never a sibling lens.
 
 Exit codes (the adlc-universal contract): **0** success or a clean human-gate
 pause with printed resume instructions · **1** operational error (bad input,
@@ -203,15 +219,47 @@ CLI: `npx do-better audit` (runs D1 then D2).
 Goal: findings that survive hostile scrutiny. Two separated roles, never the
 same context: **finders** propose, **verifiers** kill.
 
-1. For each dimension (all 8 + charter extras, descending weight), run
+1. **Packetize the whole deep-read set.** The readable deep-read files are
+   partitioned into finder **packets** (`partitionSlices`) — every file lands
+   in exactly one packet, in order, and a file too large for one packet becomes
+   its own hard-truncated singleton. This replaces the old "rotate one shared
+   ≤30 KB window" scheme, which could only ever show the finder the head of the
+   set (and, with an oversized head slice, nothing at all). For each dimension
+   (all 8 + charter extras, descending weight) and each packet, run
    fresh-context finder passes under the refutation charter
    ([references/refute-charter.md](references/refute-charter.md)): chartered to
    REFUTE acceptability, file:line on every claim, low-confidence included.
-   Each pass sees rotated code slices and prior passes' **conclusions only**
-   (titles + files, never transcripts).
-2. **Loop until dry**: a pass with zero new candidates (deduped on
-   dimension + file + normalized claim) is dry; stop at K=2 consecutive dry
-   passes; a dimension not dry within 8 passes fails the gate.
+   Each pass sees one packet's code plus prior passes' **conclusions only**
+   (titles + files pool-wide across the dimension's packets, never transcripts —
+   a finding from packet 1 is never re-proposed against packet 3).
+2. **Loop each (dimension × packet) cell until dry**: a pass with zero new
+   candidates is dry; stop at K=2 consecutive dry passes; a cell not dry within
+   8 passes fails the gate (the failure detail names the dimension AND the
+   packet). Admission is **two-layered**: (a) a free hash filter on
+   dimension + file + normalized claim rejects verbatim repeats; (b) online
+   only, each hash-survivor then faces a **cheap-tier semantic check** —
+   one `dedupe` call comparing it against prior admitted entries (this run's
+   pool **and** prior verified findings, D6) that share the same dimension AND
+   file, so a re-worded restatement the hash cannot see is suppressed (it does
+   not join the pool, does not become a finding, and does not count as "new" for
+   the dry streak, but its hash key is recorded so it is not re-litigated). This
+   semantic check is the **one sanctioned FAIL-OPEN path** in D2: an
+   unparseable response, an out-of-range index, or a network/parse error admits
+   the candidate as if new. Every other failure in D2 fails closed; this one
+   inverts deliberately, because a false-new costs only one wasted verification
+   call (which kills genuine junk anyway) while a false-duplicate permanently
+   loses a finding nothing downstream can resurrect. Offline runs skip layer (b)
+   entirely — hash-only, unchanged. An empty/unreadable deep-read set online is
+   a gate failure too — starvation is never a silent zero-finding pass. Packets that reached K=2 are recorded per head sha, so a
+   same-sha resume (after a `--budget` stop) skips them with zero re-issued
+   finder calls; a sha change discards that state and re-examines everything.
+   After the loop, a **`## D2 finder coverage`** section is written idempotently
+   into `comprehension/coverage-manifest.md`: per dimension the files examined,
+   packet count, total passes, and truncated slices, with unreadable deep-read
+   files under `### Unexamined`. Cost scales as
+   dimensions × packets × passes × poolN; `--budget` is the hard ceiling and a
+   mid-loop stop preserves every finding verified so far (findings are written
+   per candidate, not batched).
 3. **Verify every candidate** per
    [references/verification.md](references/verification.md): deterministic
    citation check, then mechanical reproduction (whitelisted command shapes,

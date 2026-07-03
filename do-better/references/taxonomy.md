@@ -8,6 +8,12 @@ prevent charter blind spots ("nobody asked about security, so nobody looked").
 A synthesized charter missing a dimension is corrected to weight 1 with a
 `(floor)` note, never dropped.
 
+Weight also governs **D2 finder-pool width**: with `--n` as the ceiling, a
+weight 4–5 dimension fans the full `--n` distinct-lens finders per pass, weight
+2–3 fans `max(1, floor(--n / 2))`, and weight 1 runs a single finder (no
+pooling). So a heavily-weighted dimension is searched both first (descending
+weight order) and wider. See the flag tables in `SKILL.md` / `README.md`.
+
 Each section below is the **finder charter** for that dimension: what a
 D2 finder chartered on this dimension hunts for, and what counts as concrete
 evidence. Finders operate under the refutation doctrine in

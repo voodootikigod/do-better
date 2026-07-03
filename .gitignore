@@ -3,3 +3,7 @@ node_modules/
 *.log
 .DS_Store
 test/.tmp/
+
+.adlc/*
+!.adlc/tickets.json
+.worktrees/
