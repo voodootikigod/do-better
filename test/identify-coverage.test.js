@@ -814,3 +814,50 @@ test("dry-cell pool width: a genuine resume with a WIDER --n re-examines cells r
   const passes2 = result2.state.phases.identify.passesByDimension.security;
   assert.equal(calls2.length / passes2, 5, "the re-examination genuinely used the wider width (5, clamped to the lens catalog), not silently narrowed back to 1");
 });
+
+test("dry-cell pool width: state predating this fix (no dryCellsPoolMax field) is treated as the safe historical default of width 1, not silently trusted at a wider resume width", async (t) => {
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  const stableFingerprint = result1.state.phases.identify.dryCellsFingerprint;
+
+  // Simulate state.json written BEFORE this fix shipped: dryCellsPoolMax is
+  // simply absent (the field did not exist), exactly as an upgrade-in-place
+  // would look. Every dry cell recorded by pre-fix code was, in fact,
+  // produced at the historical default width of 1 (pooling has always been
+  // opt-in via --n) — so the undefined fallback must behave AS IF it were 1,
+  // not silently assume a wider width it has no evidence for.
+  const interruptedState = {
+    ...result1.state,
+    phases: {
+      ...result1.state.phases,
+      identify: {
+        ...result1.state.phases.identify,
+        dryCellsComplete: false,
+        dryCellsByDimension: { security: [0] },
+        dryCellsSha: headSha,
+        dryCellsFingerprint: stableFingerprint,
+        dryCellsPoolMax: undefined,
+      },
+    },
+  };
+  delete interruptedState.phases.identify.dryCellsPoolMax;
+
+  // Resume at --n 2: if the undefined fallback wrongly assumed a width >= 2
+  // (e.g. 2), the cache would be trusted and packet 0 silently skipped even
+  // though pre-fix state carries no actual evidence it was ever searched at
+  // width 2. The safe fallback (treat as width 1) must re-examine it.
+  const log2 = makeLogFile(t);
+  const ctx2 = makeCtx({ root, dotdir, state: interruptedState, fakeFile: writeFake(t, emptyFinderFake(log2)), n: 2 });
+  const result2 = await identify.run(ctx2);
+  assert.equal(result2.gate.passed, true);
+
+  const calls2 = readLog(log2).filter((c) => c.label === "finder:security");
+  assert.ok(calls2.length > 0, "packet 0 WAS re-examined — pre-fix state with no recorded width is treated as the safe width-1 default, not silently trusted at a wider resume width");
+});
