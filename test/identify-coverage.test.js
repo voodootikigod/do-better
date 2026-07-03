@@ -19,7 +19,7 @@ import * as stateMod from "../src/state.js";
 import * as artifacts from "../src/artifacts.js";
 import * as llmMod from "../src/llm.js";
 
-const { GateError, TAXONOMY } = utils;
+const { GateError, BudgetError, TAXONOMY } = utils;
 const { PACKET_BYTES } = identify;
 
 // ---------------------------------------------------------------------------
@@ -139,13 +139,13 @@ function makeLogFile(t) {
   return path.join(dir, "calls.jsonl");
 }
 
-function makeCtx({ root, dotdir, state, fakeFile = null, offline = false }) {
+function makeCtx({ root, dotdir, state, fakeFile = null, offline = false, budget = null }) {
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY; delete env.OPENAI_API_KEY; delete env.GEMINI_API_KEY;
   delete env.DOBETTER_FAKE_LLM;
   if (!offline && fakeFile) env.DOBETTER_FAKE_LLM = fakeFile;
   const flags = {
-    command: "audit", target: root, provider: null, budget: null, offline,
+    command: "audit", target: root, provider: null, budget, offline,
     modelCheap: "claude-haiku-4-5", modelMid: "claude-sonnet-4-6", modelFrontier: "claude-opus-4-8",
     n: null, threshold: null, approve: false, yes: false, json: false, help: false,
   };
@@ -606,4 +606,80 @@ test("completion guard, round 2: an interrupted re-audit's OWN dry-cell progress
 
   const finder2 = readLog(log2).filter((c) => c.label === "finder:security").map((c) => c.prompt);
   assert.equal(finder2.length, 0, "packet A was NOT re-queried — the interrupted run's own dry-cell progress was honored on resume, despite stale status:\"done\" from the earlier completed run");
+});
+
+// ---------------------------------------------------------------------------
+// Completion guard, round 3 (adversarial review finding): the round-2 fix
+// discarded stale dry-cell state only IN MEMORY (priorDry = {}) — the
+// PERSISTED dryCellsByDimension/dryCellsSha were never cleared at the same
+// point. A BudgetError firing before the FIRST per-dimension patchPhase call
+// (realistic: it can fire on the very first finder call) left the PRIOR
+// completed run's full dry set on disk, now paired with
+// dryCellsComplete:false — so the next resume honored run-1's STALE
+// determinations instead of re-examining anything, silently defeating the
+// deliberate re-audit. This test uses a REAL BudgetError (not a
+// hand-constructed state) specifically to exercise the true early-
+// interruption window the round-2 test's single-packet fixture couldn't
+// distinguish from legitimate own-progress.
+// ---------------------------------------------------------------------------
+
+test("completion guard, round 3: an EARLY BudgetError (before any per-dimension persist) does not leave the prior completed run's stale dry set on disk", async (t) => {
+  // Two dimensions so there is a genuine "not yet reached" dimension for the
+  // early interruption to expose — security (weight 5) is processed before
+  // correctness (weight 1) by descending-weight order.
+  const files = { "a.js": packetSizedFile("MARKER_A") };
+  const now = new Date().toISOString();
+  const { root, dotdir, headSha } = makeRepo(t, files);
+  writeComprehensionInputs(dotdir, headSha, now, ["a.js"]);
+
+  // Run 1: completes successfully — both security and correctness dry
+  // immediately (zero candidates), gate passes.
+  const log1 = makeLogFile(t);
+  const ctx1 = makeCtx({ root, dotdir, state: comprehendPassedState({ headSha, now }), fakeFile: writeFake(t, emptyFinderFake(log1)) });
+  const result1 = await identify.run(ctx1);
+  assert.equal(result1.gate.passed, true);
+  assert.equal(result1.state.phases.identify.dryCellsComplete, true);
+  assert.deepEqual(result1.state.phases.identify.dryCellsByDimension.security, [0]);
+  assert.deepEqual(result1.state.phases.identify.dryCellsByDimension.correctness, [0]);
+
+  // Run 2: a genuine fresh re-audit from result1.state, under a budget so
+  // tight that the VERY FIRST finder call's projected cost exceeds it —
+  // BudgetError fires before the dims loop completes even ONE iteration,
+  // i.e. before the first per-dimension patchPhase call. MAX_OUTPUT_TOKENS
+  // (16000) alone at the mid-tier fake-pricing floor (~$15/1M out) prices
+  // any single call at >= $0.24, so a $0.01 ceiling is guaranteed to reject
+  // the first attempt regardless of prompt size.
+  const fakeAny = writeFake(t, emptyFinderFake(makeLogFile(t)));
+  const ctx2 = makeCtx({ root, dotdir, state: result1.state, fakeFile: fakeAny, budget: 0.01 });
+  let interruptedState;
+  await assert.rejects(
+    () => identify.run(ctx2),
+    (err) => {
+      assert.ok(err instanceof BudgetError, `expected BudgetError, got ${err?.constructor?.name}`);
+      assert.ok(err.state, "BudgetError carries state for the resume");
+      // The core round-3 assertion: the PERSISTED dry-cell state must NOT
+      // still be run-1's stale full set. It must be empty (nothing yet
+      // recorded for this discarded-and-restarted attempt), not
+      // {security:[0], correctness:[0]} resurrected from run 1.
+      assert.deepEqual(err.state.phases.identify.dryCellsByDimension, {}, "no stale dry-cell data survives the early interruption");
+      assert.equal(err.state.phases.identify.dryCellsComplete, false);
+      assert.equal(err.state.phases.identify.dryCellsSha, headSha);
+      interruptedState = err.state;
+      return true;
+    },
+  );
+
+  // Run 3: resume from the interrupted state with a fresh, budget-unlimited
+  // fake that logs every call. BOTH dimensions must be genuinely
+  // re-examined — proving the early interruption didn't silently resurrect
+  // run-1's stale determinations for either the already-reached-in-memory
+  // dimension or (more importantly) the not-yet-reached one.
+  const log3 = makeLogFile(t);
+  const ctx3 = makeCtx({ root, dotdir, state: interruptedState, fakeFile: writeFake(t, emptyFinderFake(log3)) });
+  const result3 = await identify.run(ctx3);
+  assert.equal(result3.gate.passed, true);
+
+  const calls3 = readLog(log3);
+  assert.ok(calls3.some((c) => c.label === "finder:security"), "security was genuinely re-examined on resume, not skipped via stale run-1 data");
+  assert.ok(calls3.some((c) => c.label === "finder:correctness"), "correctness (not yet reached when run 2 was interrupted) was ALSO genuinely re-examined, not silently trusted from run 1");
 });

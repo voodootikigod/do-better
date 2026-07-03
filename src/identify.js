@@ -800,14 +800,36 @@ export async function run(ctx) {
     const priorDry = !priorComplete && priorIdentify.dryCellsSha === headSha
       ? (priorIdentify.dryCellsByDimension ?? {})
       : {};
-    // Reset for THIS run: until identify actually finishes successfully
-    // below, dryCellsComplete stays false, so any interruption (BudgetError
-    // or a not-dry gate failure) leaves a truthfully-resumable marker behind.
-    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false });
+    // Reset for THIS run — and this must clear the PERSISTED dry-cell data
+    // too, not just the in-memory `priorDry` computed above (round-3
+    // adversarial review finding: clearing only `dryCellsComplete` left a
+    // window between here and the first per-dimension patchPhase call,
+    // below, where `state.phases.identify.dryCellsByDimension` still held
+    // the PRIOR completed run's stale set. A BudgetError firing inside that
+    // window — realistic: it can fire on the very first finder call, before
+    // any dimension's loop iteration completes — persisted exactly that
+    // stale set alongside dryCellsComplete:false, and the next resume
+    // honored it as if it were THIS run's own progress, silently skipping
+    // cells the re-audit existed to re-examine). Clearing
+    // dryCellsByDimension/dryCellsSha here, in the SAME patch, means an
+    // early interruption's persisted state truthfully shows "nothing
+    // recorded yet for this attempt" rather than resurrecting stale data.
+    // When priorComplete is false (a genuine resume) or the sha changed,
+    // this is a no-op in effect — the existing values are either what
+    // priorDry already captured (resume case) or already stale by sha
+    // mismatch (discarded either way by the read above).
+    state = patchPhase(state, PHASE_ID, { dryCellsComplete: false, dryCellsByDimension: priorDry, dryCellsSha: headSha });
 
     const passesByDimension = {};
     const packetsByDimension = {};
-    const dryCellsByDimension = {};
+    // Seeded with priorDry (not started empty): each per-dimension patchPhase
+    // call below persists this WHOLE object, overwriting the persisted key
+    // entirely — a dimension not yet reached by the loop would otherwise
+    // vanish from the persisted snapshot the moment an EARLIER dimension's
+    // own persist fires, even though its resumed data is still valid and
+    // sitting correctly in priorDry. Seeding preserves it until (and unless)
+    // that dimension's own turn genuinely overwrites its entry.
+    const dryCellsByDimension = { ...priorDry };
     const notDry = []; // [{ dim, packet }] — starvation detail names dimension AND packet
     const counts = {};
     // D6 idempotency: seed the dedupe set from already-verified findings so
