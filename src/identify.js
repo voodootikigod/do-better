@@ -462,6 +462,27 @@ function sanitizeRepro(obj, root) {
   return null;
 }
 
+// A repro is "demonstrative" — trustworthy enough to ALONE flip a candidate to
+// verified — only when it genuinely ties to the claim (H9). A repo-authored
+// test (`node --test`) and a grep with a SPECIFIC pattern qualify. A
+// model-proposed `node -e` snippet and a catch-all grep (matches virtually any
+// non-empty file) do NOT: they can pass without demonstrating anything, so a
+// candidate backed only by one is not verified on the command alone — it must
+// still earn a CONFIRM from the blind frontier verifier. As a bonus, a
+// non-demonstrative `node -e` is never executed here, removing that
+// prompt-injection surface (a hostile brownfield repo can no longer coax the
+// mid-tier proposer into running arbitrary code).
+const CATCHALL_GREP = new Set([".", ".*", ".+", ".*.*", "^", "$", "", "[\\s\\S]*", "\\S*", "\\s*", "\\w*", "[^]*"]);
+function isDemonstrativeRepro(repro) {
+  if (!repro) return false;
+  if (repro.kind === "test") return true;
+  if (repro.kind === "grep") {
+    const p = String(repro.pattern ?? "").trim();
+    return p.length > 0 && !CATCHALL_GREP.has(p);
+  }
+  return false; // eval (node -e): never demonstrative, and never run
+}
+
 function runRepro(root, repro, exec) {
   if (repro.kind === "grep") {
     const check = { type: "grep", pattern: repro.pattern, file: repro.file };
@@ -517,7 +538,10 @@ async function verifyCandidate(ctx, cand, head7) {
     if (e instanceof BudgetError) throw e;
     repro = null; // unparseable proposal → fall through to blind reread
   }
-  if (repro) {
+  // Only a DEMONSTRATIVE repro (H9) may alone verify — a non-demonstrative one
+  // (model `node -e`, catch-all grep) is ignored here and the candidate falls
+  // through to the blind reread, which must independently CONFIRM the claim.
+  if (repro && isDemonstrativeRepro(repro)) {
     const r = runRepro(root, repro, exec);
     if (r.exitCode === 0) {
       return {
@@ -533,7 +557,9 @@ async function verifyCandidate(ctx, cand, head7) {
     return { verified: false, reason: `reproduction command failed (exit ${r.exitCode})` };
   }
 
-  // b) blind frontier reread — proposer reasoning withheld (F2)
+  // b) blind frontier reread — proposer reasoning withheld (F2). Reached when no
+  // repro was proposed OR the proposal was non-demonstrative (H9): a
+  // trivially-passing check cannot alone verify a finding.
   try {
     const slice = codeSlice(root, cand.file, cand.line, 40);
     const obj = await jsonCall(llm, {

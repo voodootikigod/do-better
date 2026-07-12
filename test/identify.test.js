@@ -211,7 +211,7 @@ test("loop-until-dry: [2 new, 1 dup, 0 new] → dry at K=2, passes recorded; com
       { candidates: [CAND_A] }, // duplicate → 0 new → dry streak 1
       { candidates: [] },       // 0 new → dry streak 2 → stop
     ],
-    "repro-cmd": { reproCmd: 'node -e "process.exit(0)"' },
+    "repro-cmd": { grep: { pattern: "createServer", file: "src/server.js" } },
   };
   const ctx = makeCtx(t, { root, dotdir, state, script, logFile });
   const res = await identify.run(ctx);
@@ -380,12 +380,15 @@ test("verified findings persist a machine-re-runnable reproduction (cmd argv / c
   const state = prepState({ headSha });
   const script = {
     "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
-    "repro-cmd": { reproCmd: 'node -e "process.exit(0)"' },
+    "repro-cmd": { grep: { pattern: "createServer", file: "src/server.js" } },
   };
   const res = await identify.run(makeCtx(t, { root, dotdir, state, script }));
   assert.equal(res.state.phases.identify.verified, 1);
   const [f] = artifacts.readFindings(dotdir);
-  assert.deepEqual(f.reproduction.cmd, ["node", "-e", "process.exit(0)"], "argv persisted for refresh re-runs");
+  // A demonstrative grep repro (H9) verifies via the command path and persists a
+  // re-runnable CHECK SPEC (not a node -e argv) for refresh re-verification.
+  assert.equal(f.reproduction.method, "command");
+  assert.deepEqual(f.reproduction.check, { type: "grep", pattern: "createServer", file: "src/server.js" }, "grep check spec persisted for refresh re-runs");
   assert.equal(f.claim, CAND_A.claim, "claim persisted for re-run dedupe");
 });
 
@@ -422,7 +425,7 @@ test("H16: D2 emits a per-cell progress line with dimension, packet index, and r
   };
   const script = {
     "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
-    "repro-cmd": { reproCmd: 'node -e "process.exit(0)"' },
+    "repro-cmd": { grep: { pattern: "createServer", file: "src/server.js" } },
   };
   const res = await identify.run(makeCtx(t, { root, dotdir, state, script, log }));
   assert.equal(res.state.gates.identify.passed, true);
@@ -433,4 +436,48 @@ test("H16: D2 emits a per-cell progress line with dimension, packet index, and r
   assert.ok(secLine, `a per-cell progress line was emitted; got: ${JSON.stringify(steps.slice(0, 4))}`);
   assert.match(secLine, /verified\/\d+ killed/, "the line reports running verified/killed counts");
   assert.match(secLine, /\$\d+\.\d{2} spent/, "the line reports cumulative spend");
+});
+
+test("H9: a trivial node -e repro does NOT verify on the command alone — it falls to blind reread", { skip }, async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  writeComprehensionInputs(dotdir, headSha);
+  const state = prepState({ headSha });
+  const script = {
+    "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
+    // A non-demonstrative snippet that exits 0 regardless of the claim.
+    "repro-cmd": { reproCmd: 'node -e "1"' },
+    "verdict": { verdict: "CONFIRM", reason: "reread confirms" },
+  };
+  const res = await identify.run(makeCtx(t, { root, dotdir, state, script }));
+  assert.equal(res.state.phases.identify.verified, 1, "the candidate can still verify — but only via the blind reread");
+  const [f] = artifacts.readFindings(dotdir);
+  assert.equal(f.reproduction.method, "reread", "a trivial node -e must NOT flip the finding to method:command");
+});
+
+test("H9: a catch-all grep repro does NOT verify on the command alone — it falls to blind reread", { skip }, async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  writeComprehensionInputs(dotdir, headSha);
+  const state = prepState({ headSha });
+  const script = {
+    "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
+    "repro-cmd": { grep: { pattern: ".", file: "src/server.js" } }, // matches any non-empty file
+    "verdict": { verdict: "CONFIRM", reason: "reread confirms" },
+  };
+  const res = await identify.run(makeCtx(t, { root, dotdir, state, script }));
+  const [f] = artifacts.readFindings(dotdir);
+  assert.equal(f.reproduction.method, "reread", "a catch-all grep must NOT flip the finding to method:command");
+});
+
+test("H9: a trivial node -e repro with a KILL reread does not verify (bogus check cannot rescue it)", { skip }, async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  writeComprehensionInputs(dotdir, headSha);
+  const state = prepState({ headSha });
+  const script = {
+    "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
+    "repro-cmd": { reproCmd: 'node -e "1"' },
+    "verdict": { verdict: "KILL", reason: "claim not supported" },
+  };
+  const res = await identify.run(makeCtx(t, { root, dotdir, state, script }));
+  assert.equal(res.state.phases.identify.verified, 0, "the bogus node -e did not verify the finding");
+  assert.ok(res.state.phases.identify.killed >= 1, "the candidate is killed by the blind reread");
 });
