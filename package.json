@@ -1,6 +1,6 @@
 {
   "name": "do-better",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "Brownfield codebase analysis → verified findings → technical roadmap. The brownfield front-end to the ADLC.",
   "type": "module",
   "bin": { "do-better": "bin/cli.js", "dobetter": "bin/cli.js" },
