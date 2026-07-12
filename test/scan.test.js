@@ -289,3 +289,30 @@ test("LLM failure persists accumulated spend on err.state (resumability)", async
     }
   );
 });
+
+test("H11: spend from a paid codemap call survives on err.state when writeArtifact throws", async () => {
+  const { root, headSha } = makeRepo();
+  const dotdir = path.join(root, ".dobetter");
+  // Force writeArtifact to fail AFTER the paid codemap call: pre-create a
+  // DIRECTORY where the codemap file must be written, so the atomic file write
+  // throws (EISDIR / rename-onto-dir).
+  const codemapPath = path.join(dotdir, LAYOUT.comprehension.codemap);
+  fs.mkdirSync(codemapPath, { recursive: true });
+
+  const { llm } = makeScriptedLLM({ codemap: "# Codemap\n\nsrc/server.js — http server\n" });
+  const ctx = makeCtx(root, headSha, { llm });
+
+  await assert.rejects(
+    run(ctx),
+    (err) => {
+      // The write failed, but the codemap call's cost must not vanish: the CLI
+      // saves err.state, so it must carry the accumulated spend (H11).
+      assert.ok(err.state, "err.state is attached so the CLI can persist spend");
+      assert.ok(
+        err.state.budget.spentUSD > 0,
+        `spend must survive the write failure, got ${err.state.budget.spentUSD}`,
+      );
+      return true;
+    },
+  );
+});
