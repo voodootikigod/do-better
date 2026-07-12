@@ -935,3 +935,32 @@ test("dry-cell per-dimension weight: raising ONE dimension's charter weight (poo
   assert.ok(correctnessCalls.length > 0, "correctness WAS re-examined — its own weight increase (1->5) correctly discarded its stale width-1 dry-cell entry, even though poolMax never changed");
   assert.equal(securityCalls.length, 0, "security was NOT re-examined — its weight and width were unchanged, so its dry-cell entry remained correctly trusted (the fix is per-dimension, not a whole-cache invalidation on any weight-map edit)");
 });
+
+// ---------------------------------------------------------------------------
+// H7 — read-time truncation (content past SLICE_CHARS=24k) is DECLARED in the
+// D2 coverage manifest. Before H7 the truncatedFiles check compared the
+// already-capped raw against the larger PACKET_BYTES and so almost never fired:
+// a large file was silently reported as fully examined. A small file that fits
+// is NOT declared truncated (negative case).
+// ---------------------------------------------------------------------------
+test("H7: a deep-read file larger than SLICE_CHARS is declared truncated; a small one is not", async (t) => {
+  // One physical line of 26,000 chars: capped to 24,000 at read time, then
+  // rendered as "1: <24000 chars>" ≈ 24,003 bytes — UNDER PACKET_BYTES (30k),
+  // so the pre-H7 render-length check would have missed it entirely.
+  const bigRaw = "a".repeat(26_000);
+  const { root, dotdir, headSha } = makeRepo(t, {
+    "src/big.js": bigRaw,
+    "src/small.js": "export const x = 1;\n",
+  });
+  const now = new Date().toISOString();
+  const state = comprehendPassedState({ headSha, now });
+  writeComprehensionInputs(dotdir, headSha, now, ["src/big.js", "src/small.js"]);
+
+  const fake = writeFake(t, emptyFinderFake(makeLogFile(t)));
+  const result = await identify.run(makeCtx({ root, dotdir, state, fakeFile: fake }));
+  assert.equal(result.gate.passed, true);
+
+  const manifest = fs.readFileSync(path.join(dotdir, artifacts.LAYOUT.comprehension.coverageManifest), "utf8");
+  assert.match(manifest, /- Truncated slices:[^\n]*src\/big\.js/, "the over-SLICE_CHARS file is declared truncated");
+  assert.doesNotMatch(manifest, /- Truncated slices:[^\n]*src\/small\.js/, "the small file is NOT declared truncated");
+});

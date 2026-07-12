@@ -260,7 +260,13 @@ function loadSlices(root, files) {
   for (const file of files) {
     try {
       const raw = fs.readFileSync(path.join(root, file), "utf8");
-      slices.push({ file, raw: truncate(raw, SLICE_CHARS) });
+      // Record read-time truncation (H7): content past SLICE_CHARS is dropped
+      // here and never reaches ANY finder cell. Without this flag the coverage
+      // manifest silently claims full coverage of a large file, because the
+      // downstream truncatedFiles check compares the ALREADY-capped raw against
+      // the larger PACKET_BYTES and so almost never fires — a breach of the
+      // declared-never-silent doctrine (D10).
+      slices.push({ file, raw: truncate(raw, SLICE_CHARS), truncated: raw.length > SLICE_CHARS });
     } catch { /* unreadable — declared in coverage manifest already */ }
   }
   return slices;
@@ -572,13 +578,20 @@ async function verifyCandidate(ctx, cand, head7) {
 async function isSemanticDuplicate(ctx, cand, priorSameCell) {
   const { llm, log } = ctx;
   if (priorSameCell.length === 0) return false; // nothing to be a duplicate of — skip the call entirely
+  // Location is part of the duplicate judgment (H6): two genuinely distinct
+  // defects of the same class in one file produce near-identical title/claim
+  // text, so without file:line the cheap judge has no signal to separate
+  // "paraphrase of the same issue" from "same class at a different location" —
+  // and a false duplicate is permanently unrecoverable (see doctrine above).
   const list = priorSameCell
-    .map((p, i) => `${i}. title: ${p.title}\n   claim: ${p.claim}`)
+    .map((p, i) => `${i}. location: ${p.file}:${p.line ?? "?"}\n   title: ${p.title}\n   claim: ${p.claim}`)
     .join("\n");
   const prompt =
     `Prior findings for dimension "${cand.dimension}" in ${cand.file}:\n${list}\n\n` +
-    `New finding:\n   title: ${cand.title}\n   claim: ${cand.claim}\n\n` +
-    'Is the new finding a semantic duplicate of one listed above? Respond {"duplicateOf": <index>|null}.';
+    `New finding:\n   location: ${cand.file}:${cand.line}\n   title: ${cand.title}\n   claim: ${cand.claim}\n\n` +
+    'Is the new finding a semantic duplicate of one listed above? A different code location ' +
+    '(line) usually means a DISTINCT instance, even when the wording matches. ' +
+    'Respond {"duplicateOf": <index>|null}.';
   try {
     const obj = await jsonCall(llm, {
       prompt, system: DEDUPE_SYSTEM, tier: "cheap", label: `dedupe:${cand.dimension}`,
@@ -684,9 +697,9 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, 
     // calls differ ONLY by their assigned lens. Candidates from all N are
     // validated and deduped together — the pass's newCount is the POOLED total,
     // and the dry streak advances only when the whole pool yields zero new.
-    const priorList = priorFixed.concat(pool.map((c) => ({ title: c.title, file: c.file })));
+    const priorList = priorFixed.concat(pool.map((c) => ({ title: c.title, file: c.file, line: c.line })));
     const priorTxt = priorList.length
-      ? priorList.map((c) => `- ${c.title} (${c.file})`).join("\n")
+      ? priorList.map((c) => `- ${c.title} (${c.file}${c.line != null ? `:${c.line}` : ""})`).join("\n")
       : "(none)";
     const prompt =
       `Dimension under refutation: ${dim.label} (charter weight ${dim.weight}).\n\n` +
@@ -761,6 +774,9 @@ export async function run(ctx) {
     const headSha = gitHeadSha(root, exec);
     const head7 = headSha.slice(0, 7);
     const offline = llm.offline === true;
+    // Progress (H16): D2 is one of the two heaviest phases and previously ran
+    // in silence for tens of minutes. Announce the phase; per-cell steps below.
+    log?.phase?.("D2", `Identify${offline ? " (offline static pass)" : ""}`);
 
     const dims = orderedDimensions(charterArt.meta ?? {});
     const { base: refuteBase, lenses } = parseLenses(loadRef("refute-charter.md", FALLBACK_REFUTE), log);
@@ -778,7 +794,13 @@ export async function run(ctx) {
     const slices = loadSlices(root, declaredFiles);
     const examinedFiles = slices.map((s) => s.file);
     const unreadableFiles = declaredFiles.filter((f) => !examinedFiles.includes(f));
-    const truncatedFiles = slices.filter((s) => renderSlice(s).length > PACKET_BYTES).map((s) => s.file);
+    // A file is truncated (H7) if it was capped at read time (content past
+    // SLICE_CHARS dropped) OR if its numbered render still overflows a packet
+    // (hard-truncated by buildFinderPacket as a singleton). Both are undeclared
+    // coverage loss unless surfaced here.
+    const truncatedFiles = slices
+      .filter((s) => s.truncated || renderSlice(s).length > PACKET_BYTES)
+      .map((s) => s.file);
     const dryCellsFingerprint = packetSetFingerprint(slices);
 
     // Partition the whole readable set into packets (online only); offline runs
@@ -914,6 +936,10 @@ export async function run(ctx) {
       // too, not just repeats within this run.
       (priorByDim[prior.dimension] ??= []).push({
         dimension: prior.dimension, title: prior.title, claim: prior.claim ?? prior.title, file,
+        // line rides along so the semantic-dedupe judge can tell two distinct
+        // same-class defects in one file apart (H6). evidence[0].line is the
+        // pinned citation line; null when a prior finding lacks one.
+        line: prior.evidence?.[0]?.line ?? null,
       });
     }
     let killed = 0;
@@ -986,6 +1012,12 @@ export async function run(ctx) {
         if (cell.dry) dryCells.push(pi);
         else notDry.push({ dim: dim.id, packet: pi });
         await verifyAndRecord(dim.id, cell.newCands);
+        // Per-cell progress (H16): dimension, packet index, pass count, running
+        // verified/killed, and cumulative spend — all already in scope.
+        log?.step?.(
+          `[${dim.id}] packet ${pi + 1}/${packets.length} · ${cell.passes} pass${cell.passes === 1 ? "" : "es"}` +
+          ` · ${counts[dim.id].verified} verified/${counts[dim.id].killed} killed · $${llm.spentSoFar().toFixed(2)} spent`,
+        );
         // Persist incrementally so a BudgetError mid-loop leaves the dry-cell
         // state (and verified findings, already on disk) recoverable on re-run.
         passesByDimension[dim.id] = totalPasses;
