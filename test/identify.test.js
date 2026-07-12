@@ -481,3 +481,21 @@ test("H9: a trivial node -e repro with a KILL reread does not verify (bogus chec
   assert.equal(res.state.phases.identify.verified, 0, "the bogus node -e did not verify the finding");
   assert.ok(res.state.phases.identify.killed >= 1, "the candidate is killed by the blind reread");
 });
+
+test("H9: a node --test repro is demonstrative — it verifies via the command path", { skip }, async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  writeComprehensionInputs(dotdir, headSha);
+  const state = prepState({ headSha });
+  const script = {
+    "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
+    // A repo-authored test file (the fixture ships test/server.test.js, a noop
+    // that exits 0) is a DEMONSTRATIVE repro and must verify via method:command,
+    // NOT fall through to the blind reread.
+    "repro-cmd": { reproCmd: "node --test test/server.test.js" },
+  };
+  const res = await identify.run(makeCtx(t, { root, dotdir, state, script }));
+  assert.equal(res.state.phases.identify.verified, 1);
+  const [f] = artifacts.readFindings(dotdir);
+  assert.equal(f.reproduction.method, "command", "a node --test repro verifies via the command path");
+  assert.equal(f.reproduction.exitCode, 0);
+});
