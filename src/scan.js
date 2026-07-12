@@ -3,7 +3,7 @@
 // questions with concrete code facts (spec D8, §6 cheap tier).
 import fs from "node:fs";
 import path from "node:path";
-import { OpError, git, gitHeadSha, readJsonSafe, truncate } from "./utils.js";
+import { OpError, git, gitHeadSha, readJsonSafe, truncate, warnIfDirtyTree } from "./utils.js";
 import { addSpend, pinSha, recordPhase } from "./state.js";
 import { LAYOUT, writeArtifact } from "./artifacts.js";
 import { withFallback } from "./llm.js";
@@ -269,6 +269,7 @@ export async function run(ctx) {
   const { root, dotdir, exec, llm, log } = ctx;
   log.phase("D-1", "Scan");
   const headSha = requireHeadSha(root, exec);
+  warnIfDirtyTree(root, exec, log, "D-1 scan"); // H10 — declared, never silent
 
   log.step("Collecting deterministic repo facts (no LLM)");
   const facts = collectRepoFacts(root, exec);

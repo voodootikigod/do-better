@@ -316,3 +316,26 @@ test("H11: spend from a paid codemap call survives on err.state when writeArtifa
     },
   );
 });
+
+test("H10: scan warns (declared) when the working tree is dirty, and is silent when clean", async () => {
+  const { root, headSha } = makeRepo();
+  const { llm } = makeScriptedLLM({ codemap: "# Codemap\n\nclean\n" });
+
+  // Clean tree → no dirty-tree warning.
+  const cleanWarnings = [];
+  const cleanLog = { ...stubLog(), warn: (m) => cleanWarnings.push(String(m)) };
+  const ctxClean = { ...makeCtx(root, headSha, { llm }), log: cleanLog };
+  await run(ctxClean);
+  assert.ok(!cleanWarnings.some((w) => /uncommitted change/.test(w)), "no dirty-tree warning on a clean tree");
+
+  // Introduce an uncommitted change → declared warning.
+  fs.writeFileSync(path.join(root, "src/util.js"), "export function add(a, b) { return a + b; } // edited\n");
+  const { llm: llm2 } = makeScriptedLLM({ codemap: "# Codemap\n\ndirty\n" });
+  const dirtyWarnings = [];
+  const dirtyLog = { ...stubLog(), warn: (m) => dirtyWarnings.push(String(m)) };
+  const ctxDirty = { ...makeCtx(root, headSha, { llm: llm2 }), log: dirtyLog };
+  await run(ctxDirty);
+  const w = dirtyWarnings.find((m) => /uncommitted change/.test(m));
+  assert.ok(w, `a declared dirty-tree warning is emitted; got ${JSON.stringify(dirtyWarnings)}`);
+  assert.match(w, /file:line@sha|committed blob/, "the warning explains the citation-provenance risk");
+});

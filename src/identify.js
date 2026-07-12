@@ -5,7 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import {
   OpError, BudgetError, GateError, sha256Hex, isSafeRelPath, truncate,
-  readPackageFile, gitHeadSha, TAXONOMY, mapLimit,
+  readPackageFile, gitHeadSha, TAXONOMY, mapLimit, warnIfDirtyTree,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, nextFindingId } from "./state.js";
 import { LAYOUT, readArtifact, readFindings, runReproCheck, verifyCitations, writeArtifact, writeFinding } from "./artifacts.js";
@@ -810,6 +810,7 @@ export async function run(ctx) {
     if (!charterArt) throw new OpError("Missing .dobetter/charter.md — run `do-better charter` first.");
     const headSha = gitHeadSha(root, exec);
     const head7 = headSha.slice(0, 7);
+    warnIfDirtyTree(root, exec, log, "D2 identify"); // H10 — declared, never silent
     const offline = llm.offline === true;
     // Progress (H16): D2 is one of the two heaviest phases and previously ran
     // in silence for tens of minutes. Announce the phase; per-cell steps below.

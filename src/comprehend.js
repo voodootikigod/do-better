@@ -4,7 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import {
   OpError, GateError, truncate, readPackageFile, gitHeadSha,
-  writeFileAtomic, readJsonSafe, isSafeRelPath, mapLimit,
+  writeFileAtomic, readJsonSafe, isSafeRelPath, mapLimit, warnIfDirtyTree,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha } from "./state.js";
 import {
@@ -364,6 +364,7 @@ export async function run(ctx) {
 
     const headSha = gitHeadSha(root, exec);
     const head7 = headSha.slice(0, 7);
+    warnIfDirtyTree(root, exec, log, "D1 comprehend"); // H10 — declared, never silent
     ensureLayout(dotdir);
 
     const offline = llm.offline === true;

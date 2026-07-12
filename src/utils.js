@@ -318,6 +318,41 @@ export function gitHeadSha(root, exec = makeExec()) {
   return git(root, ["rev-parse", "HEAD"], exec);
 }
 
+// Working-tree cleanliness (H10). All read phases pin citations to HEAD's sha
+// but read the WORKING TREE via fs; on a dirty tree those `file:line@sha` claims
+// are attributed to a commit that does not contain that content. Returns
+// { clean, dirtyCount }; a failed status probe is treated as clean (never
+// blocks a run — the warning is advisory, degrade loudly not fatally).
+export function workingTreeStatus(root, exec = makeExec()) {
+  const r = exec("git", ["status", "--porcelain"], { cwd: root });
+  if (r.status !== 0) return { clean: true, dirtyCount: 0 };
+  const lines = (r.stdout ?? "").split("\n").filter((l) => {
+    if (l.trim() === "") return false;
+    // Ignore do-better's OWN output dir (.dobetter/) — it is the artifact of the
+    // run, not a source change that would misattribute a citation, and it would
+    // otherwise flag every re-run as "dirty".
+    const p = l.slice(3).replace(/^"|"$/g, "");
+    return !(p === ".dobetter" || p.startsWith(".dobetter/"));
+  });
+  return { clean: lines.length === 0, dirtyCount: lines.length };
+}
+
+// A one-line declared warning that a phase is minting @sha citations against a
+// dirty working tree (H10) — "declared, never silent" per the doctrine. Emits
+// via log.warn when dirty; a no-op when clean. Returns the status for callers
+// that want to record it.
+export function warnIfDirtyTree(root, exec, log, phaseLabel) {
+  const status = workingTreeStatus(root, exec);
+  if (!status.clean) {
+    log?.warn?.(
+      `${phaseLabel}: working tree has ${status.dirtyCount} uncommitted change(s) — ` +
+      "file:line@sha citations are pinned to HEAD but read from the working tree, " +
+      "so claims may not match the committed blob. Commit before a citable run for exact provenance.",
+    );
+  }
+  return status;
+}
+
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------
