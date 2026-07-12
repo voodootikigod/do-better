@@ -5,7 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import {
   OpError, BudgetError, GateError, sha256Hex, isSafeRelPath, truncate,
-  readPackageFile, gitHeadSha, TAXONOMY,
+  readPackageFile, gitHeadSha, TAXONOMY, mapLimit,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, nextFindingId } from "./state.js";
 import { LAYOUT, readArtifact, readFindings, runReproCheck, verifyCitations, writeArtifact, writeFinding } from "./artifacts.js";
@@ -708,15 +708,26 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, 
       `Code under review:\n${packetText}\n\n` +
       'Return JSON {"candidates":[{"title":"...","claim":"...","file":"src/x.js","line":12,"severity":"critical|high|medium|low","confidence":0.8}]} — empty array if nothing new.';
     let newCount = 0;
-    for (let i = 0; i < poolWidth; i++) {
-      const lens = lenses[(passIndex + i) % lenses.length];
-      const system = `${base}\n\nLens: ${lens.text}`;
-      // A BudgetError from any pooled call rethrows immediately (stop-the-world,
-      // matching the single-finder contract); any other error, after the LLM
-      // layer's own retries, propagates and fails the phase (fail closed — a
-      // silently absent pool member would be undeclared coverage loss).
-      const obj = await jsonCall(llm, { prompt, system, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
-      const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
+    // The poolWidth finder calls in a pass differ ONLY by their lens and share
+    // one prompt/prior-conclusions context — they are independent, so run them
+    // concurrently (H8) with bounded concurrency = poolWidth. A BudgetError from
+    // any pooled call still rethrows stop-the-world (after in-flight siblings
+    // settle); any other error, after the LLM layer's own retries, propagates
+    // and fails the phase (fail closed — a silently absent pool member would be
+    // undeclared coverage loss). Admission below stays SEQUENTIAL in lens-index
+    // order, so seen/pool/semantic-dedupe ordering is identical to the previous
+    // one-at-a-time loop — the concurrency is wall-clock only, not behavioral.
+    const rawByLens = await mapLimit(
+      Array.from({ length: poolWidth }, (_, i) => i),
+      poolWidth,
+      async (i) => {
+        const lens = lenses[(passIndex + i) % lenses.length];
+        const system = `${base}\n\nLens: ${lens.text}`;
+        const obj = await jsonCall(llm, { prompt, system, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
+        return Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
+      },
+    );
+    for (const raw of rawByLens) {
       for (const r of raw) {
         const cand = validateCandidate(r, dim.id, log);
         if (!cand) continue;

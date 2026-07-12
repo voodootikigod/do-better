@@ -14,6 +14,7 @@ import {
   git,
   isSafeRelPath,
   makeExec,
+  mapLimit,
   nowIso,
   parseArgs,
   readJsonSafe,
@@ -238,4 +239,45 @@ test("readPackageFile resolves relative to the do-better package root", () => {
   const pkg = readPackageFile("package.json");
   assert.match(pkg, /"name": "do-better"/);
   assert.throws(() => readPackageFile("no/such/file.md"), OpError);
+});
+
+// --- mapLimit (H8 bounded concurrency) ---------------------------------------
+
+test("mapLimit preserves INPUT order regardless of completion order", async () => {
+  // Later items resolve sooner; results must still match input order.
+  const out = await mapLimit([30, 10, 20], 3, (ms, i) =>
+    new Promise((r) => setTimeout(() => r(`${i}:${ms}`), ms)));
+  assert.deepEqual(out, ["0:30", "1:10", "2:20"]);
+});
+
+test("mapLimit never exceeds the concurrency limit", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const fn = async () => {
+    inFlight++; peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return null;
+  };
+  await mapLimit([1, 2, 3, 4, 5, 6, 7], 2, fn);
+  assert.ok(peak <= 2, `peak concurrency ${peak} must not exceed 2`);
+  assert.ok(peak >= 1);
+});
+
+test("mapLimit propagates the first rejection after in-flight tasks settle", async () => {
+  const settled = [];
+  await assert.rejects(
+    mapLimit([1, 2, 3], 2, async (n) => {
+      if (n === 2) throw new Error("boom-2");
+      await new Promise((r) => setTimeout(r, 3));
+      settled.push(n);
+      return n;
+    }),
+    (err) => err instanceof Error && /boom-2/.test(err.message),
+  );
+});
+
+test("mapLimit handles empty input and clamps limit to >= 1", async () => {
+  assert.deepEqual(await mapLimit([], 4, async () => 1), []);
+  assert.deepEqual(await mapLimit([5, 6], 0, async (n) => n * 2), [10, 12]);
 });

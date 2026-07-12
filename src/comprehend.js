@@ -4,7 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import {
   OpError, GateError, truncate, readPackageFile, gitHeadSha,
-  writeFileAtomic, readJsonSafe, isSafeRelPath,
+  writeFileAtomic, readJsonSafe, isSafeRelPath, mapLimit,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha } from "./state.js";
 import {
@@ -395,10 +395,13 @@ export async function run(ctx) {
     if (offline) {
       behaviors = grepBehaviors(root, plan.deepRead.concat(plan.scan));
     } else {
-      let bpi = 0;
-      for (const packet of packets) {
-        bpi += 1;
-        log?.step?.(`Behavior inventory · packet ${bpi}/${packets.length} · $${llm.spentSoFar().toFixed(2)} spent`);
+      // The per-packet behavior calls are independent (results merged and
+      // deduped afterward), so run them concurrently (H8). Validated entries are
+      // returned per packet and merged in PACKET ORDER below, so the inventory
+      // is byte-identical to the previous sequential loop — concurrency is
+      // wall-clock only.
+      const perPacket = await mapLimit(packets, packets.length, async (packet, i) => {
+        log?.step?.(`Behavior inventory · packet ${i + 1}/${packets.length} · $${llm.spentSoFar().toFixed(2)} spent`);
         const obj = await jsonCall(
           llm,
           {
@@ -410,12 +413,15 @@ export async function run(ctx) {
           () => ({ behaviors: grepBehaviors(root, plan.deepRead) }),
         );
         const arr = Array.isArray(obj) ? obj : Array.isArray(obj?.behaviors) ? obj.behaviors : [];
+        const out = [];
         for (const raw of arr) {
           const b = validateBehavior(raw);
-          if (b) behaviors.push(b);
+          if (b) out.push(b);
           else log?.warn?.("behavior-inventory: dropped invalid entry (fail closed)");
         }
-      }
+        return out;
+      });
+      for (const arr of perPacket) behaviors.push(...arr);
     }
     const seen = new Set();
     behaviors = behaviors.filter((b) => {
@@ -429,24 +435,34 @@ export async function run(ctx) {
     log?.step?.(`Reader artifacts (codemap, architecture, dependencies, rails-map, glossary) · $${llm.spentSoFar().toFixed(2)} spent`);
     const offlineNote = (title, extra = "") =>
       `# ${title}\n\n(structure-only) Offline degradation — no LLM narrative.\n${extra}`;
+    // The five reader artifacts have no data dependency on each other (rails-map
+    // reads `behaviors`, already fully computed above), so run them concurrently
+    // (H8) with bounded concurrency. Each reader's result is assigned to its own
+    // named slot, so completion order is irrelevant — output is byte-identical
+    // to the previous sequential assignment.
+    const readerDefs = [
+      { key: "codemap", run: () => readerText(llm, "codemap",
+        "Verify and extend this codemap draft: one line of purpose per top-level directory and major file.",
+        packets, () => structureCodemap(facts)) },
+      { key: "architecture", run: () => readerText(llm, "architecture",
+        "Describe the intended design versus the actual implementation drift you can evidence in the code.",
+        packets, () => offlineNote("Architecture", (facts.topDirs ?? []).map((d) => `- \`${d.dir}/\``).join("\n"))) },
+      { key: "dependencies", run: () => (offline
+        ? Promise.resolve("## Risk flags\n\n(structure-only) EOL/CVE flags require online verification.")
+        : readerText(llm, "dependencies",
+            "Flag dependency risks (EOL, known-CVE-prone, coupling hotspots). Mark every external-knowledge flag as \"needs verification\".",
+            [packets[0]], () => "## Risk flags\n\n(structure-only)")) },
+      { key: "railsMap", run: () => readerText(llm, "rails-map",
+        `Map these observable behaviors to existing tests; mark each covered or load-bearing-but-untested.\nBehaviors:\n${behaviorsToBody(behaviors, head7)}`,
+        [packets[0]], () => "# Rails Map\n\n(structure-only) Existing tests:\n" + (facts.testDirs ?? []).map((d) => `- \`${d}/\``).join("\n") + "\n\nBehavior coverage unknown offline.") },
+      { key: "glossary", run: () => readerText(llm, "glossary",
+        "Build a glossary mapping business/domain terms to code terms, citing where each term is defined or used.",
+        [packets[0]], () => "# Glossary\n\n(structure-only) No glossary terms extracted offline.") },
+    ];
+    const readerResults = await mapLimit(readerDefs, 4, (d) => d.run());
     const bodies = {};
-    bodies.codemap = await readerText(llm, "codemap",
-      "Verify and extend this codemap draft: one line of purpose per top-level directory and major file.",
-      packets, () => structureCodemap(facts));
-    bodies.architecture = await readerText(llm, "architecture",
-      "Describe the intended design versus the actual implementation drift you can evidence in the code.",
-      packets, () => offlineNote("Architecture", (facts.topDirs ?? []).map((d) => `- \`${d.dir}/\``).join("\n")));
-    bodies.dependencies = depsSection(root, facts) + "\n\n" + (offline
-      ? "## Risk flags\n\n(structure-only) EOL/CVE flags require online verification."
-      : await readerText(llm, "dependencies",
-          "Flag dependency risks (EOL, known-CVE-prone, coupling hotspots). Mark every external-knowledge flag as \"needs verification\".",
-          [packets[0]], () => "## Risk flags\n\n(structure-only)"));
-    bodies.railsMap = await readerText(llm, "rails-map",
-      `Map these observable behaviors to existing tests; mark each covered or load-bearing-but-untested.\nBehaviors:\n${behaviorsToBody(behaviors, head7)}`,
-      [packets[0]], () => "# Rails Map\n\n(structure-only) Existing tests:\n" + (facts.testDirs ?? []).map((d) => `- \`${d}/\``).join("\n") + "\n\nBehavior coverage unknown offline.");
-    bodies.glossary = await readerText(llm, "glossary",
-      "Build a glossary mapping business/domain terms to code terms, citing where each term is defined or used.",
-      [packets[0]], () => "# Glossary\n\n(structure-only) No glossary terms extracted offline.");
+    readerDefs.forEach((d, i) => { bodies[d.key] = readerResults[i]; });
+    bodies.dependencies = depsSection(root, facts) + "\n\n" + bodies.dependencies;
 
     // 5) Citation gate + write artifacts
     const writeScrubbed = (relPath, body, meta) => {

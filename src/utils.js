@@ -345,6 +345,35 @@ export function truncate(text, maxChars) {
   return `${s.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
+// Zero-dep bounded-concurrency map (H8). Runs `fn(item, index)` over `items`
+// with at most `limit` in flight, returns results in INPUT order (never
+// completion order), and on the first rejection stops pulling new work, lets
+// the in-flight tasks settle, then rejects with that first error. limit is
+// clamped to >= 1. Used to fan out independent LLM calls (D2 pooled finders,
+// D1 readers) without changing result ordering or gate semantics.
+export async function mapLimit(items, limit, fn) {
+  const arr = Array.from(items);
+  const results = new Array(arr.length);
+  const lim = Math.max(1, Math.trunc(Number(limit)) || 1);
+  let next = 0;
+  let firstErr = null;
+  async function worker() {
+    while (next < arr.length && firstErr === null) {
+      const i = next++;
+      try {
+        results[i] = await fn(arr[i], i);
+      } catch (err) {
+        if (firstErr === null) firstErr = err;
+      }
+    }
+  }
+  const workers = [];
+  for (let w = 0; w < Math.min(lim, arr.length); w++) workers.push(worker());
+  await Promise.all(workers);
+  if (firstErr !== null) throw firstErr;
+  return results;
+}
+
 // Resolve a file relative to THIS package's root (not the target repo) — used
 // to load do-better/SKILL.md and do-better/references/*.md as prompt sources.
 export function readPackageFile(relPath) {
