@@ -312,6 +312,29 @@ test("budget: first call fits, second call is refused with resume instructions",
   );
 });
 
+test("budget is enforced across drainSpend cycles (cross-phase run does not forget prior spend)", async () => {
+  // Regression for the cross-phase under-enforcement bug: one llm instance
+  // spans every phase of `do-better run`; each phase ends with drainSpend().
+  // If drainSpend() zeroes the accumulator without promoting it into the
+  // running total, later phases' budget checks forget all prior spend and the
+  // hard --budget ceiling is silently blown.
+  const fakePath = writeFakeModule(FIXED_FAKE);
+  const haiku = PRICES[DEFAULT_MODELS.anthropic.cheap];
+  const projection = (100 / 1e6) * haiku.in + (MAX_OUTPUT_TOKENS / 1e6) * haiku.out;
+  const actualCost = (100 / 1e6) * haiku.in + (2 / 1e6) * haiku.out;
+  // Room for one call's projection plus a sliver of actual spend — the SECOND
+  // call in a later "phase" adds projection on top of phase 1's recorded
+  // actualCost and must be refused, even though drainSpend() ran in between.
+  const limit = projection + actualCost * 0.5;
+
+  const llm = createLLM({ flags: { budget: limit }, env: fakeEnv(fakePath) });
+  const prompt = "x".repeat(400);
+  await llm.call(prompt, { tier: "cheap" }); // phase 1
+  llm.drainSpend(); // phase boundary — spend written to state, accumulator zeroed
+  // phase 2: cumulative spend across the drain must still count against the cap.
+  await assert.rejects(llm.call(prompt, { tier: "cheap" }), BudgetError);
+});
+
 test("budget limit and prior spend come from state.json when no --budget flag", async () => {
   const fakePath = writeFakeModule(FIXED_FAKE);
   const state = { budget: { limitUSD: 0.05, spentUSD: 0.04 } };
@@ -376,4 +399,66 @@ test("cleanJsonResponse extracts JSON from fences, prose, and arrays", () => {
   assert.equal(cleanJsonResponse('Sure! Here you go: {"a":1} — enjoy'), '{"a":1}');
   assert.equal(cleanJsonResponse("[1, 2, 3] trailing"), "[1, 2, 3]");
   assert.equal(cleanJsonResponse('```\n[{"x":1}]\n```'), '[{"x":1}]');
+});
+
+// ── H5: provider request builders (anthropic + gemini) ──────────────────────
+// These are the default real-run path (anthropic is first in AUTODETECT_ORDER)
+// yet buildRequest's anthropic/gemini branches had zero coverage — the fake
+// seam bypasses the network builder entirely. Drive createLLM with a
+// request-capturing fetchImpl so a typo in URL/headers/body/parse cannot ship
+// green.
+
+test("H5: anthropic request builder — url, headers, body shape, and parse()", async () => {
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, body: JSON.parse(init.body), headers: init.headers });
+    return { ok: true, json: async () => ({ content: [{ text: "hi" }], usage: { input_tokens: 11, output_tokens: 4 } }) };
+  };
+  const llm = createLLM({ flags: { provider: "anthropic" }, env: { ANTHROPIC_API_KEY: "sk-test" }, fetchImpl });
+  assert.equal(llm.provider, "anthropic");
+
+  const text = await llm.call("ask", { system: "be terse", tier: "mid", label: "t" });
+  assert.equal(text, "hi", "parse() extracts content[0].text");
+
+  const [req] = seen;
+  assert.equal(req.url, "https://api.anthropic.com/v1/messages");
+  assert.equal(req.headers["x-api-key"], "sk-test");
+  assert.equal(req.headers["anthropic-version"], "2023-06-01");
+  assert.equal(req.body.messages[0].content, "ask");
+  assert.equal(req.body.system, "be terse", "system is a top-level field for anthropic");
+  assert.ok(req.body.max_tokens > 0);
+
+  const spend = llm.drainSpend();
+  assert.equal(spend.tokensIn, 11, "parse() reads usage.input_tokens");
+  assert.equal(spend.tokensOut, 4, "parse() reads usage.output_tokens");
+});
+
+test("H5: gemini request builder — url, systemInstruction, responseMimeType on jsonMode, and parse()", async () => {
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, body: JSON.parse(init.body), headers: init.headers });
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: "{}" }] } }],
+        usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 2 },
+      }),
+    };
+  };
+  const llm = createLLM({ flags: { provider: "gemini" }, env: { GEMINI_API_KEY: "g-key" }, fetchImpl });
+  assert.equal(llm.provider, "gemini");
+
+  // callJson forces jsonMode → responseMimeType must be set.
+  const obj = await llm.callJson("ask", { system: "sys", tier: "mid", label: "t" });
+  assert.deepEqual(obj, {});
+
+  const [req] = seen;
+  assert.match(req.url, /^https:\/\/generativelanguage\.googleapis\.com\/v1beta\/models\/.+:generateContent\?key=g-key$/);
+  assert.equal(req.body.contents[0].parts[0].text, "ask");
+  assert.equal(req.body.systemInstruction.parts[0].text, "sys", "system maps to systemInstruction for gemini");
+  assert.equal(req.body.generationConfig.responseMimeType, "application/json", "jsonMode sets responseMimeType");
+
+  const spend = llm.drainSpend();
+  assert.equal(spend.tokensIn, 7, "parse() reads usageMetadata.promptTokenCount");
+  assert.equal(spend.tokensOut, 2, "parse() reads usageMetadata.candidatesTokenCount");
 });

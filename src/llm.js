@@ -281,7 +281,12 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
   } else if (typeof state?.budget?.limitUSD === "number" && Number.isFinite(state.budget.limitUSD) && state.budget.limitUSD > 0) {
     limit = state.budget.limitUSD;
   }
-  const spentBase = Number.isFinite(state?.budget?.spentUSD) ? state.budget.spentUSD : 0;
+  // Running total of spend already reconciled out of the accumulator. Seeded
+  // from state.budget.spentUSD and ADVANCED by drainSpend() on every phase
+  // boundary — one llm instance spans all phases of `do-better run`, so without
+  // this promotion each drain would make later phases' budget checks forget all
+  // prior spend and silently blow the hard --budget ceiling (D10).
+  let spentBase = Number.isFinite(state?.budget?.spentUSD) ? state.budget.spentUSD : 0;
 
   const accumulated = { calls: 0, tokensIn: 0, tokensOut: 0, costUSD: 0 };
   let fakeFnPromise = null;
@@ -420,11 +425,21 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
 
   function drainSpend() {
     const out = { ...accumulated };
+    // Promote drained cost into the running base BEFORE zeroing, so the budget
+    // ceiling keeps counting cumulative spend across phase boundaries.
+    spentBase += accumulated.costUSD;
     accumulated.calls = 0;
     accumulated.tokensIn = 0;
     accumulated.tokensOut = 0;
     accumulated.costUSD = 0;
     return out;
+  }
+
+  // Non-destructive read of cumulative USD spent so far (base + not-yet-drained
+  // accumulator) — for progress display (H16). Unlike drainSpend() this does
+  // NOT zero the accumulator, so it is safe to call mid-phase.
+  function spentSoFar() {
+    return spentBase + accumulated.costUSD;
   }
 
   return {
@@ -434,6 +449,7 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
     call,
     callJson,
     drainSpend,
+    spentSoFar,
     estimateTokens,
   };
 }

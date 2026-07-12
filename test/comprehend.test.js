@@ -161,7 +161,7 @@ function makeFakeAdlcDir(t) {
   };
 }
 
-function makeCtx(t, { root, dotdir, state, script = {}, offline = false, adlc = ABSENT_ADLC, flagsExtra = {}, logFile = null }) {
+function makeCtx(t, { root, dotdir, state, script = {}, offline = false, adlc = ABSENT_ADLC, flagsExtra = {}, logFile = null, log = quietLog }) {
   const flags = {
     command: "audit", target: root, provider: null, budget: null, offline,
     // NOTE: blueprint defaults these to null, but WP-B resolveModels validates
@@ -177,7 +177,7 @@ function makeCtx(t, { root, dotdir, state, script = {}, offline = false, adlc = 
   if (!offline) env.DOBETTER_FAKE_LLM = writeFakeLLM(t, script, { logFile });
   const llm = llmMod.createLLM({ flags, state, env });
   return {
-    root, dotdir, state, llm, adlc, flags, log: quietLog,
+    root, dotdir, state, llm, adlc, flags, log,
     now: () => new Date().toISOString(), exec: utils.makeExec(), ask: null,
   };
 }
@@ -319,4 +319,35 @@ test("offline: structure-only behavior inventory finds app.get(\"/health\")", { 
   assert.equal(res.state.gates.comprehend.degraded, "single-reading");
   const manifest = artifacts.readArtifact(dotdir, artifacts.LAYOUT.comprehension.coverageManifest);
   assert.ok(/offline/.test(manifest.body), "offline degradation declared");
+});
+
+test("H16: D1 emits a phase header and a per-packet behavior-inventory progress line", { skip }, async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  const head7 = headSha.slice(0, 7);
+  writeCharter(dotdir, headSha);
+  const state = prepState({ headSha });
+  const phases = [];
+  const steps = [];
+  const log = {
+    ...quietLog,
+    phase(code, title) { phases.push(`${code} ${title}`); },
+    step(msg) { steps.push(String(msg)); },
+  };
+  const ctx = makeCtx(t, { root, dotdir, state, script: readerScript(head7), adlc: ABSENT_ADLC, log });
+  const res = await comprehend.run(ctx);
+  assert.equal(res.state.gates.comprehend.passed, true);
+
+  assert.ok(phases.some((p) => /^D1 Comprehend/.test(p)), "the D1 phase header is announced");
+  // Per-packet behavior-inventory line: pins the counter STRUCTURE (packet
+  // starts at 1, "n/N" shape) and the two-decimal spend format — killing the
+  // bpi-start, bpi-increment, and .toFixed(2) mutations without pinning any
+  // specific run's numbers (doctrine: structure, not values).
+  const behLine = steps.find((s) => /^Behavior inventory · packet \d+\/\d+/.test(s));
+  assert.ok(behLine, `a behavior-inventory progress line was emitted; got ${JSON.stringify(steps)}`);
+  assert.match(behLine, /packet 1\//, "the packet counter starts at 1 (not 0 or 2)");
+  assert.match(behLine, /\$\d+\.\d{2} spent/, "spend is formatted to exactly two decimals");
+  // Reader-artifacts progress line also carries the two-decimal spend format.
+  const readerLine = steps.find((s) => /^Reader artifacts/.test(s));
+  assert.ok(readerLine, "a reader-artifacts progress line was emitted");
+  assert.match(readerLine, /\$\d+\.\d{2} spent/, "reader-artifacts spend is two decimals");
 });

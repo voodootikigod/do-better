@@ -274,7 +274,6 @@ export async function run(ctx) {
   const facts = collectRepoFacts(root, exec);
 
   let state = ctx.state;
-  let body;
   try {
     log.step("Drafting codemap (cheap tier)");
     const value = await withFallback(
@@ -282,24 +281,30 @@ export async function run(ctx) {
       { prompt: buildCodemapPrompt(facts), tier: "cheap", label: "codemap" },
       () => OFFLINE_MARKER
     );
-    body =
+    const body =
       value === OFFLINE_MARKER || typeof value !== "string" || !value.trim()
         ? deterministicTreeCodemap(facts)
         : value;
+
+    // writeArtifact/recordPhase run inside the try so a post-call failure
+    // (disk full, permissions) still attaches accumulated spend to err.state
+    // below — otherwise the paid codemap call's cost vanishes from
+    // budget.spentUSD and later runs under-count against --budget (H11).
+    writeArtifact(dotdir, LAYOUT.comprehension.codemap, {
+      meta: { generatedBy: "scan", headSha, draft: true },
+      body,
+    });
+
+    state = addSpend(state, PHASE_ID, llm.drainSpend());
+    state = recordPhase(state, PHASE_ID, { status: "done", sha: headSha, now: ctx.now(), facts });
+    state = pinSha(state, PHASE_ID, headSha);
   } catch (err) {
     // Persist spend accumulated before the failure (CLI saves err.state).
-    err.state = addSpend(state, PHASE_ID, llm.drainSpend());
+    // Guard against double-drain: if state already absorbed the spend (failure
+    // after addSpend), the accumulator is empty and this is a no-op.
+    if (!err.state) err.state = addSpend(state, PHASE_ID, llm.drainSpend());
     throw err;
   }
-
-  writeArtifact(dotdir, LAYOUT.comprehension.codemap, {
-    meta: { generatedBy: "scan", headSha, draft: true },
-    body,
-  });
-
-  state = addSpend(state, PHASE_ID, llm.drainSpend());
-  state = recordPhase(state, PHASE_ID, { status: "done", sha: headSha, now: ctx.now(), facts });
-  state = pinSha(state, PHASE_ID, headSha);
 
   const summary = buildSummary(facts);
   log.success("Scan complete");

@@ -10,7 +10,7 @@ description: >-
 license: MIT
 user-invocable: true
 keywords: [brownfield, codebase-analysis, roadmap, tech-debt, characterization-tests, findings, adlc, audit]
-argument-hint: "[path] [--provider anthropic|gemini|openai] [--budget N] [--offline]"
+argument-hint: "[path] [--provider anthropic|gemini|openai|local] [--budget N] [--offline]"
 metadata:
   version: 0.1.0
   author: Chris Williams (@voodootikigod)
@@ -87,7 +87,7 @@ CLI flags (manual mode: treat each as an instruction you honor by hand):
 
 | Flag | Semantics | Fail-closed rule |
 |---|---|---|
-| `--provider anthropic\|gemini\|openai` | Force LLM provider. Default: autodetect from env, Anthropic first (`ANTHROPIC_API_KEY` → `GEMINI_API_KEY` → `OPENAI_API_KEY`). | Named provider without its key is an error, not a silent fallback. No key at all is an error naming the three env vars and `--offline`. |
+| `--provider anthropic\|gemini\|openai\|local` | Force LLM provider. Default: autodetect from env, Anthropic first (`ANTHROPIC_API_KEY` → `GEMINI_API_KEY` → `OPENAI_API_KEY`), then a configured local endpoint (`DOBETTER_LOCAL_BASE_URL` + `DOBETTER_LOCAL_MODEL`) last. | Named provider without its key/URL is an error, not a silent fallback. No key at all is an error naming the env vars and `--offline`. |
 | `--budget <usd>` | Hard USD ceiling across all phases; per-phase spend recorded in `state.json`. | Projected overrun **refuses the call and stops** with resume instructions — completed work is preserved, never truncated silently. |
 | `--offline` | No LLM calls: static analysis + structure-only artifacts. | Degradations are declared in `coverage-manifest.md` and gate records — never silent. Network/parse failures are NOT downgraded to offline; they fail. |
 | `--model-cheap / --model-mid / --model-frontier <id>` | Override one tier's model (see Model tiering). | Model names are validated; shell-metacharacter names are rejected. |
@@ -240,7 +240,10 @@ same context: **finders** propose, **verifiers** kill.
    only, each hash-survivor then faces a **cheap-tier semantic check** —
    one `dedupe` call comparing it against prior admitted entries (this run's
    pool **and** prior verified findings, D6) that share the same dimension AND
-   file, so a re-worded restatement the hash cannot see is suppressed (it does
+   file. The judge is given each entry's `file:line` and the candidate's, so a
+   different code location is treated as a **distinct instance** even when the
+   wording matches — only a genuine re-wording of the *same* location is
+   suppressed (it does
    not join the pool, does not become a finding, and does not count as "new" for
    the dry streak, but its hash key is recorded so it is not re-litigated). This
    semantic check is the **one sanctioned FAIL-OPEN path** in D2: an

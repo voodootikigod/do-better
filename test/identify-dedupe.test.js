@@ -380,3 +380,97 @@ test("AC4: semantic check is cheap-tier, hash-survivors only, same dimension+fil
   assert.doesNotMatch(call.prompt, /other-dim-prior|prior-correctness-util-claim/,
     "a prior in a different dimension must NOT be in the comparison list");
 });
+
+// ---------------------------------------------------------------------------
+// H6 — the semantic-dedupe judge and finder prior-list carry file:line, so two
+// distinct same-class defects in one file (identical wording, different lines)
+// are not conflated. Verifies the PLUMBING: the dedupe prompt must render the
+// location of every prior entry AND of the new candidate (absent before H6).
+// ---------------------------------------------------------------------------
+test("H6: dedupe prompt and finder prior-list include file:line for prior and candidate", async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  const now = new Date().toISOString();
+  const state = comprehendPassedState({ headSha, now });
+  writeComprehensionInputs(dotdir, headSha, now);
+
+  // Same file, DIFFERENT lines, DIFFERENT wording (so the hash filter passes
+  // both through to the semantic judge — the hash keys off normalized claim,
+  // not line). The judge (scripted null) treats them as distinct.
+  const first = cand({ title: "swallowed error near top", claim: "an error is caught and dropped without logging", file: "src/util.js", line: 1 });
+  const second = cand({ title: "swallowed error lower down", claim: "a second catch block discards its error silently", file: "src/util.js", line: 2 });
+
+  const logFile = newLogFile(t);
+  const fake = writeFakeLLM(t, {
+    script: {
+      "finder:security": [
+        { candidates: [first] },  // pass 1: admitted (no prior → no dedupe call)
+        { candidates: [second] }, // pass 2: hash-survivor → semantic judge runs
+        { candidates: [] },       // pass 3: dry
+      ],
+      "dedupe:security": { duplicateOf: null }, // judge: distinct location → not a duplicate
+    },
+    logFile,
+  });
+  const result = await identify.run(makeCtx({ root, dotdir, state, fakeLLMFile: fake }));
+  assert.equal(result.gate.passed, true);
+
+  // Both distinct-location defects are admitted and verified.
+  const findings = artifacts.readFindings(dotdir);
+  assert.equal(findings.length, 2, "two distinct-location same-class defects are both admitted");
+
+  // The dedupe prompt for the second candidate must render BOTH locations —
+  // the prior entry's file:line AND the new candidate's file:line. Before H6
+  // neither appeared, so the judge had no location signal.
+  const dedupeCalls = readCalls(logFile).filter((c) => c.label === "dedupe:security");
+  assert.equal(dedupeCalls.length, 1, "exactly one semantic-dedupe call (for the hash-survivor)");
+  const p = dedupeCalls[0].prompt;
+  assert.match(p, /src\/util\.js:1/, "the prior entry's file:line is in the dedupe prompt");
+  assert.match(p, /src\/util\.js:2/, "the new candidate's file:line is in the dedupe prompt");
+
+  // The pass-2 finder prompt lists the prior conclusion WITH its line, not bare file.
+  const finderCalls = readCalls(logFile).filter((c) => c.label === "finder:security");
+  const withPrior = finderCalls.find((c) => /swallowed error near top/.test(c.prompt));
+  assert.ok(withPrior, "a finder pass saw the first finding as a prior conclusion");
+  assert.match(withPrior.prompt, /src\/util\.js:1/, "the finder prior-conclusions list carries the line, not just the file");
+});
+
+// ---------------------------------------------------------------------------
+// H6 (cross-run) — a PRIOR verified finding (seeded from readFindings) carries
+// its evidence[0].line into the dedupe prompt on a later run, so a re-run's
+// semantic judge can also distinguish a distinct new location from a paraphrase
+// of last run's finding. Pins the readFindings → priorByDim → evidence[0].line
+// plumbing (an off-by-one to evidence[1] must be caught).
+// ---------------------------------------------------------------------------
+test("H6: a prior verified finding's evidence line reaches the dedupe prompt on re-run", async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  const now = new Date().toISOString();
+  const state = comprehendPassedState({ headSha, now });
+  writeComprehensionInputs(dotdir, headSha, now);
+
+  // Run 1: admit and verify a finding at line 1.
+  const first = cand({ title: "swallowed error at the guard", claim: "the top guard drops its error without logging", file: "src/util.js", line: 1 });
+  const fake1 = writeFakeLLM(t, {
+    script: { "finder:security": [{ candidates: [first] }, { candidates: [] }] },
+  });
+  const r1 = await identify.run(makeCtx({ root, dotdir, state, fakeLLMFile: fake1 }));
+  assert.equal(r1.gate.passed, true);
+  assert.equal(artifacts.readFindings(dotdir).length, 1);
+
+  // Run 2: a distinct-wording candidate in the same file at a DIFFERENT line.
+  // Its semantic-dedupe comparison list is the PRIOR verified finding (seeded
+  // via readFindings), whose evidence[0].line (1) must appear in the prompt.
+  const second = cand({ title: "silent discard further down", claim: "a later block eats its exception with no trace", file: "src/util.js", line: 2 });
+  const logFile = newLogFile(t);
+  const fake2 = writeFakeLLM(t, {
+    script: { "finder:security": [{ candidates: [second] }, { candidates: [] }], "dedupe:security": { duplicateOf: null } },
+    logFile,
+  });
+  const r2 = await identify.run(makeCtx({ root, dotdir, state: r1.state, fakeLLMFile: fake2 }));
+  assert.equal(r2.gate.passed, true);
+
+  const dedupeCalls = readCalls(logFile).filter((c) => c.label === "dedupe:security");
+  assert.equal(dedupeCalls.length, 1, "the new candidate is compared against the prior verified finding");
+  const p = dedupeCalls[0].prompt;
+  assert.match(p, /src\/util\.js:1/, "the prior verified finding's evidence[0].line is in the dedupe prompt");
+  assert.match(p, /src\/util\.js:2/, "the new candidate's line is in the dedupe prompt");
+});

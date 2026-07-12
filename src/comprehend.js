@@ -367,6 +367,8 @@ export async function run(ctx) {
     ensureLayout(dotdir);
 
     const offline = llm.offline === true;
+    // Progress (H16): D1 is the other heavy phase that previously ran silent.
+    log?.phase?.("D1", `Comprehend${offline ? " (offline structure-only)" : ""}`);
     const parallaxAvailable = !offline && adlc?.available?.parallax === true;
     const readings = parallaxAvailable ? (flags.n ?? 3) : 1;
     const threshold = flags.threshold ?? 0.25;
@@ -393,7 +395,10 @@ export async function run(ctx) {
     if (offline) {
       behaviors = grepBehaviors(root, plan.deepRead.concat(plan.scan));
     } else {
+      let bpi = 0;
       for (const packet of packets) {
+        bpi += 1;
+        log?.step?.(`Behavior inventory · packet ${bpi}/${packets.length} · $${llm.spentSoFar().toFixed(2)} spent`);
         const obj = await jsonCall(
           llm,
           {
@@ -421,6 +426,7 @@ export async function run(ctx) {
     });
 
     // 4) Remaining readers
+    log?.step?.(`Reader artifacts (codemap, architecture, dependencies, rails-map, glossary) · $${llm.spentSoFar().toFixed(2)} spent`);
     const offlineNote = (title, extra = "") =>
       `# ${title}\n\n(structure-only) Offline degradation — no LLM narrative.\n${extra}`;
     const bodies = {};

@@ -343,3 +343,90 @@ test("run: idempotent — second refresh does not duplicate stale annotations", 
   assert.equal(count(afterSecond), count(afterFirst), "stale markers not duplicated");
   assert.equal(second.state.phases.refresh.status, "done");
 });
+
+// A verified finding whose reproduction is a blind reread (method "reread"),
+// produced in production by identify.js's blind-frontier-reread path.
+function seedFindingReread(root, id) {
+  const sha = headOf(root);
+  writeFinding(path.join(root, ".dobetter"), {
+    id, dimension: "security", title: `Reread ${id}`, severity: "high", confidence: 0.9,
+    evidence: [{ file: "src/util.js", line: 1, sha: sha.slice(0, 7) }],
+    reproduction: { method: "reread", record: "CONFIRM (blind reread): the add helper trusts its inputs", exitCode: null },
+    status: "verified", foundAt: "2026-06-12T00:00:00.000Z", headSha: sha, stale: false,
+  });
+}
+
+// H13 — the reread re-verdict branch (KILL/CONFIRM/UNCERTAIN + fenced JSON).
+async function runRereadRefresh(root, verdictResp) {
+  const dotdir = path.join(root, ".dobetter");
+  const state = sealState(root);
+  commitChange(root, "src/util.js", "export function add(a, b) { return a + b; } // touched\n");
+  const llm = makeFakeLLM({ codemap: "- updated", verdict: verdictResp });
+  const result = await run(makeCtx(root, { state, llm }));
+  return { result, dotdir };
+}
+
+test("H13: reread verdict KILL resolves the finding (RESOLVED stamp + resolvedIds)", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  seedComprehended(root);
+  seedFindingReread(root, "F-SEC-0100");
+  const { result, dotdir } = await runRereadRefresh(root, { verdict: "KILL" });
+  const f = readArtifact(dotdir, "findings/F-SEC-0100.md");
+  assert.match(f.body, /RESOLVED @ /, "KILL stamps the finding RESOLVED");
+  assert.equal(f.meta.stale, true);
+  assert.match(result.summary, /resolved: F-SEC-0100/);
+});
+
+test("H13: reread verdict CONFIRM keeps the finding, clears stale, re-pins evidence", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  seedComprehended(root);
+  seedFindingReread(root, "F-SEC-0101");
+  const { dotdir } = await runRereadRefresh(root, { verdict: "CONFIRM" });
+  const newSha7 = headOf(root).slice(0, 7);
+  const f = readArtifact(dotdir, "findings/F-SEC-0101.md");
+  assert.equal(f.meta.stale, false, "CONFIRM clears stale");
+  assert.ok(String(f.meta.evidence[0]).includes(`@${newSha7}`), "evidence re-pinned to the new sha");
+});
+
+test("H13: reread verdict UNCERTAIN leaves the finding stale, unresolved", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  seedComprehended(root);
+  seedFindingReread(root, "F-SEC-0102");
+  const { result, dotdir } = await runRereadRefresh(root, { verdict: "UNCERTAIN" });
+  const f = readArtifact(dotdir, "findings/F-SEC-0102.md");
+  assert.equal(f.meta.stale, true, "UNCERTAIN stays stale");
+  assert.doesNotMatch(f.body, /RESOLVED @ /, "UNCERTAIN does not resolve");
+  assert.doesNotMatch(result.summary, /resolved: F-SEC-0102/);
+});
+
+test("H13: a fenced-JSON reread verdict is parsed via coerceJson", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  seedComprehended(root);
+  seedFindingReread(root, "F-SEC-0103");
+  // Verdict arrives wrapped in a ```json fence — coerceJson (refresh.js:48-53)
+  // must strip it. If it were not parsed, the finding would stay stale.
+  const { result, dotdir } = await runRereadRefresh(root, '```json\n{"verdict":"KILL"}\n```');
+  const f = readArtifact(dotdir, "findings/F-SEC-0103.md");
+  assert.match(f.body, /RESOLVED @ /, "fenced KILL is parsed and resolves the finding");
+  assert.match(result.summary, /resolved: F-SEC-0103/);
+});
+
+test("H12: a stale finding's marker cites the diff-base sha, not current HEAD", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  seedComprehended(root);
+  seedFindingReread(root, "F-SEC-0104");
+  const state = sealState(root);
+  const baseSha7 = headOf(root).slice(0, 7); // the diff base (pins.comprehend)
+  commitChange(root, "src/util.js", "export function add(a, b) { return a + b; } // moved\n");
+  const headSha7 = headOf(root).slice(0, 7); // current HEAD after the change
+  assert.notEqual(baseSha7, headSha7);
+
+  // UNCERTAIN → finding stays stale, so annotateStale's marker survives verbatim.
+  const llm = makeFakeLLM({ codemap: "- updated", verdict: { verdict: "UNCERTAIN" } });
+  const dotdir = path.join(root, ".dobetter");
+  await run(makeCtx(root, { state, llm }));
+
+  const f = readArtifact(dotdir, "findings/F-SEC-0104.md");
+  assert.match(f.body, new RegExp(`changed since ${baseSha7}`), "stale marker cites the diff-base sha");
+  assert.doesNotMatch(f.body, new RegExp(`changed since ${headSha7}`), "stale marker does NOT cite current HEAD");
+});

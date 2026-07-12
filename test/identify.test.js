@@ -154,7 +154,7 @@ const ABSENT_ADLC = Object.freeze({
   },
 });
 
-function makeCtx(t, { root, dotdir, state, script = {}, offline = false, logFile = null }) {
+function makeCtx(t, { root, dotdir, state, script = {}, offline = false, logFile = null, log = quietLog }) {
   const flags = {
     command: "audit", target: root, provider: null, budget: null, offline,
     // NOTE: blueprint defaults these to null, but WP-B resolveModels validates
@@ -170,7 +170,7 @@ function makeCtx(t, { root, dotdir, state, script = {}, offline = false, logFile
   if (!offline) env.DOBETTER_FAKE_LLM = writeFakeLLM(t, script, { logFile });
   const llm = llmMod.createLLM({ flags, state, env });
   return {
-    root, dotdir, state, llm, adlc: ABSENT_ADLC, flags, log: quietLog,
+    root, dotdir, state, llm, adlc: ABSENT_ADLC, flags, log,
     now: () => new Date().toISOString(), exec: utils.makeExec(), ask: null,
   };
 }
@@ -407,4 +407,30 @@ test("offline: deterministic static pass per dimension; static repro survives, f
   assert.equal(todo.reproduction.check?.file, "src/server.js");
   assert.ok(res.state.phases.identify.killed >= 1, "no-tests claim killed: fixture has a test dir (reproduce-or-kill applies offline too)");
   assert.match(res.summary, /DEGRADED/i, "offline degradation declared, never silent");
+});
+
+test("H16: D2 emits a per-cell progress line with dimension, packet index, and running counts", { skip }, async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  writeComprehensionInputs(dotdir, headSha);
+  const state = prepState({ headSha });
+  const steps = [];
+  const phases = [];
+  const log = {
+    ...quietLog,
+    phase(code, title) { phases.push(`${code} ${title}`); },
+    step(msg) { steps.push(String(msg)); },
+  };
+  const script = {
+    "finder:security": [{ candidates: [CAND_A] }, { candidates: [] }],
+    "repro-cmd": { reproCmd: 'node -e "process.exit(0)"' },
+  };
+  const res = await identify.run(makeCtx(t, { root, dotdir, state, script, log }));
+  assert.equal(res.state.gates.identify.passed, true);
+
+  assert.ok(phases.some((p) => /^D2 Identify/.test(p)), "the D2 phase header is announced");
+  // At least one per-cell line for security naming its packet index and counts.
+  const secLine = steps.find((s) => /^\[security\] packet \d+\/\d+/.test(s));
+  assert.ok(secLine, `a per-cell progress line was emitted; got: ${JSON.stringify(steps.slice(0, 4))}`);
+  assert.match(secLine, /verified\/\d+ killed/, "the line reports running verified/killed counts");
+  assert.match(secLine, /\$\d+\.\d{2} spent/, "the line reports cumulative spend");
 });

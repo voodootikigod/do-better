@@ -115,7 +115,7 @@ function reverifyInventory(ctx, changedSet) {
 }
 
 // 5. re-verify stale findings (reproduce again, or kill the claim's staleness)
-async function reverifyFindings(ctx, changedSet, headSha) {
+async function reverifyFindings(ctx, changedSet, headSha, pinned) {
   const sha7 = headSha.slice(0, 7);
   const resolvedIds = [];
   let staleFlagged = 0;
@@ -126,7 +126,12 @@ async function reverifyFindings(ctx, changedSet, headSha) {
     const rel = `${LAYOUT.findingsDir}/${finding.id}.md`;
     const art = readArtifact(ctx.dotdir, rel);
     if (!art) continue;
-    const annotated = annotateStale(art.body, { changedFiles: [...changedSet], asOfSha: ctx.state.pins?.[PHASE_ID] ?? headSha, now: ctx.now() }).body;
+    // asOfSha is the DIFF BASE (pinned), not pins.refresh (H12): "changed
+    // since <X>" must name the sha the changed-file diff was computed against —
+    // the same base flagStaleArtifacts uses. pins.refresh named the current
+    // HEAD on first refresh (vacuously "changed since itself") and a stale
+    // last-refresh sha thereafter, since the diff base never advances.
+    const annotated = annotateStale(art.body, { changedFiles: [...changedSet], asOfSha: pinned ?? headSha, now: ctx.now() }).body;
     let verdict = null; // "resolved" | "verified" | null (stays stale)
     if (finding.reproduction?.method === "reread") {
       const raw = await withFallback(ctx.llm, {
@@ -209,7 +214,7 @@ export async function run(ctx) {
   await refreshCodemap(ctx, [...changedSet], pinned);
   reverifyInventory(ctx, changedSet);
   // 5. re-verify stale findings
-  const { resolvedIds, staleFlagged } = await reverifyFindings(ctx, changedSet, headSha);
+  const { resolvedIds, staleFlagged } = await reverifyFindings(ctx, changedSet, headSha, pinned);
   staleClaims += staleFlagged;
 
   // 7. roadmap living-document update
