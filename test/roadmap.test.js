@@ -491,3 +491,38 @@ test("H14: coldstart tool absent + offline — degrades to static-lint, gate pas
   assert.equal(result.state.gates.roadmap.coldstartDegraded, "static-lint", "the offline degradation is declared, never silent");
   assert.match(result.summary, /coldstart degraded: static-lint/);
 });
+
+test("H14: a ticket whose edge targets an unknown ticket stays invalid after repair → demoted to Later", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  const dotdir = path.join(root, ".dobetter");
+  seedCharter(dotdir, { security: 5, dx: 1 });
+  writeFinding(dotdir, finding(root, "F-SEC-0001", "security", { severity: "high" }));
+  writeFinding(dotdir, finding(root, "F-DX-0002", "dx", { severity: "medium" }));
+  // normalizeTicket keeps a well-formed edge object, but an edge to a ticket id
+  // that does not exist fails validateTicket ("edge to unknown ticket") — the
+  // repair returns the same bad edge, so the item is demoted (fail closed).
+  const badEdge = { ...TICKET_JSON("Bad edge ticket"), edges: [{ to: "NOPE", contract: "boundary.ts" }] };
+  const llm = makeFakeLLM({
+    score: { items: [
+      { id: "F-SEC-0001", impact: "L", effort: "S", confidence: 0.9 }, // score 4.5 → Now → T1 (valid)
+      { id: "F-DX-0002", impact: "L", effort: "S", confidence: 0.9 },   // score 0.9 → Next → T2 (bad edge)
+    ] },
+    "ticket:T1": TICKET_JSON("Valid ticket"),
+    "ticket:T2": badEdge,
+    "ticket-repair": badEdge,
+  });
+  const ctx = makeCtx(root, {
+    state: seedState(root), llm,
+    adlcAvailable: { coldstart: true }, adlcScript: { coldstart: { status: 0, stdout: { results: [] } } },
+  });
+  const result = await run(ctx);
+
+  const tickets = readTickets(dotdir);
+  assert.equal(tickets.length, 1, "only the valid ticket persists");
+  assert.equal(tickets[0].id, "T1");
+  assert.equal(result.state.phases.roadmap.ticketCount, 1);
+  // The demoted finding lands in Later — never silently dropped.
+  const roadmap = readArtifact(dotdir, LAYOUT.roadmap);
+  const laterSection = roadmap.body.split("## Later")[1] ?? "";
+  assert.match(laterSection, /F-DX-0002/, "the demoted finding is surfaced in the Later phase");
+});
