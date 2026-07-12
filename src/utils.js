@@ -39,6 +39,24 @@ export const log = {
   errorTrace: (err) => console.error(colors.dim(String((err && err.stack) || err))),
 };
 
+// Under --json (H17), decorative progress must NOT pollute stdout — stdout has
+// to carry ONLY the final JSON object so a CI wrapper can parse the whole
+// stream. This variant routes every human-facing line (including the ones phase
+// modules emit via ctx.log: phase/step/substep/success/info) to STDERR; warn
+// and error already go to stderr. Callers pass this as ctx.log when flags.json.
+export const stderrLog = {
+  info: (m) => console.error(`${colors.blue("ℹ")} ${m}`),
+  success: (m) => console.error(`${colors.green("✔")} ${m}`),
+  warn: log.warn,
+  error: log.error,
+  phase: (id, name) => console.error(colors.bold(colors.cyan(`\n=== ${id}: ${name} ===`))),
+  gate: (name, human) =>
+    console.error(colors.bold(colors.magenta(`\n=== ⟂ Gate: ${name}${human ? " (HUMAN)" : ""} ===`))),
+  step: (m) => console.error(`  ${m}`),
+  substep: (m) => console.error(colors.dim(`    ${m}`)),
+  errorTrace: log.errorTrace,
+};
+
 // ---------------------------------------------------------------------------
 // Error classes (exit-code contract: 0 success/human pause, 1 operational,
 // 2 deterministic gate failure)

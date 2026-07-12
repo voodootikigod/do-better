@@ -165,3 +165,29 @@ test("deterministic gate failure exits 2 (fake parallax FAKE_EXIT=2)", { skip: !
     assert.equal(audit.status, 0, `stderr: ${audit.stderr}\nstdout: ${audit.stdout}`);
   }
 });
+
+test("H17: --json success emits ONE parseable envelope on stdout with spend + counts", { skip: !SCAN_PRESENT && skipNote }, (t) => {
+  const dir = makeTmpRepo(t);
+  const r = cli(["scan", dir, "--offline", "--json"]);
+  assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+  // The WHOLE of stdout must parse as one JSON object — no interleaved human lines.
+  const env = JSON.parse(r.stdout.trim());
+  assert.equal(env.ok, true);
+  assert.equal(env.command, "scan");
+  assert.equal(typeof env.spendUSD, "number", "spend is in the envelope");
+  assert.ok("artifactsDir" in env, "artifact dir is in the envelope");
+  // Progress/banner decoration must NOT be on stdout under --json.
+  assert.doesNotMatch(r.stdout, /=== D-1/, "phase headers routed off stdout under --json");
+});
+
+test("H17: --json failure emits a parseable {ok:false,error} envelope on stdout (exit code intact)", { skip: !SCAN_PRESENT && skipNote }, (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dobetter-nogit-json-"));
+  fs.cpSync(FIXTURE, dir, { recursive: true });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const r = cli(["scan", dir, "--offline", "--json"]);
+  assert.equal(r.status, 1, "operational error exit code preserved");
+  const env = JSON.parse(r.stdout.trim());
+  assert.equal(env.ok, false);
+  assert.equal(env.command, "scan");
+  assert.ok(env.error && typeof env.error.kind === "string", "a typed error envelope on stdout for CI");
+});

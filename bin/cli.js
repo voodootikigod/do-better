@@ -13,6 +13,7 @@ import {
   colors,
   gitHeadSha,
   log,
+  stderrLog,
   makeExec,
   nowIso,
   parseArgs,
@@ -39,6 +40,17 @@ const HUMAN_GATE_INSTRUCTIONS = {
 
 function importPhase(name) {
   return import(new URL(`../src/${name}.js`, import.meta.url));
+}
+
+// Machine-readable run stats for the --json envelope (H17): spend and the
+// identify verified/killed counts, all already sitting in state at emit time.
+function stateStats(state) {
+  const identify = state?.phases?.identify ?? {};
+  return {
+    spendUSD: Number.isFinite(state?.budget?.spentUSD) ? state.budget.spentUSD : 0,
+    verified: Number.isInteger(identify.verified) ? identify.verified : null,
+    killed: Number.isInteger(identify.killed) ? identify.killed : null,
+  };
 }
 
 function makeAsk(env) {
@@ -117,7 +129,10 @@ async function main() {
 
   if (!flags.json) console.log(colors.dim(`do-better v${VERSION} · ${flags.command} · ${root}`));
 
-  let ctx = { root, dotdir, state, llm, adlc, flags, log, now: nowIso, exec, ask };
+  // Under --json, stdout must carry ONLY the final JSON envelope — route all
+  // phase-module progress (ctx.log.phase/step/…) to stderr (H17).
+  const activeLog = flags.json ? stderrLog : log;
+  let ctx = { root, dotdir, state, llm, adlc, flags, log: activeLog, now: nowIso, exec, ask };
   let runId = null;
   let paused = false;
   let lastSummary = "";
@@ -196,7 +211,11 @@ async function main() {
     state = finishRun(state, runId, { now: nowIso(), ok: true });
     saveState(dotdir, state);
     if (flags.json) {
-      console.log(JSON.stringify({ command: flags.command, ok: true, paused, summary: lastSummary }));
+      console.log(JSON.stringify({
+        command: flags.command, ok: true, paused, summary: lastSummary,
+        artifactsDir: path.relative(process.cwd(), dotdir) || ".dobetter",
+        ...stateStats(state),
+      }));
     }
     return 0;
   } catch (err) {
@@ -212,6 +231,15 @@ async function main() {
       saveState(dotdir, state);
     } catch {
       /* never mask the original error with a save failure */
+    }
+    // A CI wrapper gets a parseable failure envelope on stdout (H17); the human
+    // message still prints to stderr via the top-level handler. Exit code is set
+    // there too, so the two stay consistent.
+    if (flags.json) {
+      const error = err instanceof GateError
+        ? { kind: "gate", gate: err.gate, detail: err.detail }
+        : { kind: err instanceof OpError ? "operational" : "error", message: err instanceof Error ? err.message : String(err) };
+      console.log(JSON.stringify({ command: flags.command, ok: false, error, ...stateStats(state) }));
     }
     throw err;
   } finally {
