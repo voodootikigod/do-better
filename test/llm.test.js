@@ -487,3 +487,64 @@ test("H5: gemini request builder — url, systemInstruction, responseMimeType on
   assert.equal(spend.tokensIn, 7, "parse() reads usageMetadata.promptTokenCount");
   assert.equal(spend.tokensOut, 2, "parse() reads usageMetadata.candidatesTokenCount");
 });
+
+// ── H3/H4: callProvider retry classification, backoff, spend accounting ──────
+// Driven through a request-capturing fetchImpl + an injected sleepImpl spy, so
+// the reliability layer for every online call is tested without real delays.
+
+function anthropicLLM({ fetchImpl, sleeps }) {
+  return createLLM({
+    flags: { provider: "anthropic" },
+    env: { ANTHROPIC_API_KEY: "k" },
+    fetchImpl,
+    sleepImpl: async (ms) => { sleeps.push(ms); },
+  });
+}
+const okBody = (text = "ok") => ({ ok: true, json: async () => ({ content: [{ text }], usage: { input_tokens: 5, output_tokens: 2 } }) });
+const httpErr = (status) => ({ ok: false, status, text: async () => `error ${status}` });
+
+test("H4: retry-then-succeed on attempt 2 records spend once and sleeps once", async () => {
+  const sleeps = [];
+  let n = 0;
+  const fetchImpl = async () => (++n === 1 ? httpErr(503) : okBody("pong"));
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  assert.equal(await llm.call("hi", { tier: "mid", label: "t" }), "pong");
+  assert.equal(n, 2, "second attempt succeeded");
+  assert.deepEqual(sleeps, [1000], "one backoff sleep before the retry");
+  assert.equal(llm.drainSpend().calls, 1, "spend recorded exactly once");
+});
+
+test("H4: exhaustion throws OpError naming provider/model after RETRY_ATTEMPTS", async () => {
+  const sleeps = [];
+  const fetchImpl = async () => httpErr(503);
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  await assert.rejects(
+    llm.call("hi", { tier: "mid", label: "t" }),
+    (err) => err instanceof OpError && /anthropic\//.test(err.message) && /after 3 attempts/.test(err.message),
+  );
+  assert.deepEqual(sleeps, [1000, 2000], "backoff doubles across the two inter-attempt sleeps");
+});
+
+test("H4: a permanent 400 fails after ONE attempt with no retry sleeps", async () => {
+  const sleeps = [];
+  let n = 0;
+  const fetchImpl = async () => { n++; return httpErr(400); };
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  await assert.rejects(llm.call("hi", { tier: "mid", label: "t" }), OpError);
+  assert.equal(n, 1, "no retry on a non-retryable 4xx");
+  assert.deepEqual(sleeps, [], "no backoff sleeps for a permanent error");
+});
+
+test("H4: a billed-but-unparseable 200 records the billed spend and does not retry", async () => {
+  const sleeps = [];
+  let n = 0;
+  // 200 OK, tokens billed (usage present), but no content[0].text → parse throws.
+  const fetchImpl = async () => { n++; return { ok: true, json: async () => ({ usage: { input_tokens: 12 }, note: "safety-blocked" }) }; };
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  await assert.rejects(llm.call("hi", { tier: "mid", label: "t" }), OpError);
+  assert.equal(n, 1, "billed-but-unparseable is not retried (would only re-bill)");
+  assert.deepEqual(sleeps, []);
+  const spend = llm.drainSpend();
+  assert.equal(spend.tokensIn, 12, "the billed input tokens were recorded, not lost");
+  assert.ok(spend.costUSD > 0, "billed spend reaches the budget counter");
+});

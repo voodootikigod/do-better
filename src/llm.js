@@ -261,9 +261,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Retry only transient failures (H3): network errors (no HTTP status), request
+// timeout (408), rate limit (429), and 5xx. A permanent 4xx (400 bad request,
+// 401/403 auth, 404 model, 422 unprocessable) or a response-parse failure is
+// not worth re-issuing — it fails the same way and only burns backoff sleeps
+// (and, for a billed-but-unparseable body, re-bills). `err.status` is attached
+// at the non-ok throw site; its absence means a network/transport error.
+function isRetryable(err) {
+  const s = err?.status;
+  if (typeof s !== "number") return true; // network / transport — worth retrying
+  return s === 408 || s === 429 || s >= 500;
+}
+
 // Create the LLM service object — the ONE sanctioned mutable accumulator
 // (spend). Never returns null; offline still constructs.
-export function createLLM({ flags = {}, state = null, env = process.env, fetchImpl = globalThis.fetch } = {}) {
+export function createLLM({ flags = {}, state = null, env = process.env, fetchImpl = globalThis.fetch, sleepImpl = sleep } = {}) {
   const fakePath = env.DOBETTER_FAKE_LLM || null;
   // Test seam: when DOBETTER_FAKE_LLM is set, providers/keys are ignored
   // entirely and no network code path is reachable.
@@ -370,18 +382,37 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
         });
         if (!res.ok) {
           const errText = await res.text();
-          throw new Error(`${config.provider} API error (${res.status}): ${errText}`);
+          const httpErr = new Error(`${config.provider} API error (${res.status}): ${errText}`);
+          httpErr.status = res.status; // lets isRetryable classify 4xx vs 5xx
+          throw httpErr;
         }
         const data = await res.json();
-        const { text, tokensIn, tokensOut } = req.parse(data);
+        let parsed;
+        try {
+          parsed = req.parse(data);
+        } catch (parseErr) {
+          // Billed-but-unparseable (H3): the provider returned 200 and charged
+          // for the tokens, but the body has no usable text (e.g. a
+          // safety-blocked Gemini candidate, an OpenAI refusal shape). Record
+          // the billed spend BEFORE failing so it never escapes the budget
+          // counter, and mark the error non-retryable (the same body reparses
+          // the same way — retrying only re-bills).
+          recordSpend(intOrNull(data?.usage?.input_tokens ?? data?.usage?.prompt_tokens ?? data?.usageMetadata?.promptTokenCount) ?? estimateTokens(prompt + system), 0, tier);
+          parseErr.status = 200;
+          throw parseErr;
+        }
+        const { text, tokensIn, tokensOut } = parsed;
         recordSpend(tokensIn ?? estimateTokens(prompt + system), tokensOut ?? estimateTokens(text), tier);
         return text;
       } catch (err) {
         lastErr = err;
-        if (attempt < RETRY_ATTEMPTS) {
+        if (attempt < RETRY_ATTEMPTS && isRetryable(err)) {
           log.warn(`${label}: LLM call failed (attempt ${attempt}/${RETRY_ATTEMPTS}): ${err.message} — retrying in ${delay}ms`);
-          await sleep(delay);
+          await sleepImpl(delay);
           delay *= 2;
+        } else if (!isRetryable(err)) {
+          // Permanent failure — stop immediately, do not burn further attempts.
+          break;
         }
       }
     }
