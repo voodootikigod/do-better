@@ -106,8 +106,10 @@ npx do-better run         # full pipeline; stops at human gates
 npx do-better refresh     # idempotent re-run; diffs vs state.json; only changed files
 ```
 
-Flags: `--provider anthropic|gemini|openai` (skill-mining pattern), `--budget`,
-`--offline` (degrades to static analysis + structure-only artifacts).
+Flags: `--provider anthropic|gemini|openai|local` (skill-mining pattern; `local`
+targets any OpenAI-compatible endpoint via `DOBETTER_LOCAL_BASE_URL` +
+`DOBETTER_LOCAL_MODEL`), `--budget`, `--offline` (degrades to static analysis +
+structure-only artifacts).
 
 Phase-per-command is required, not convenience: enterprise engagements pause
 days at human gates; state.json makes every phase resumable.

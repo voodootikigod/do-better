@@ -148,7 +148,7 @@ with the dry loop settling near its `K_DRY = 2` floor (best case) and its
 | dimensions | 8 | taxonomy floor (+ any charter extras) |
 | packets | ~5 | reference shape; grows with deep-read size / file size |
 | passes per cell | 2 – 8 | `K_DRY = 2` when a cell settles immediately; `MAX_PASSES = 8` cap |
-| N | `poolN` | finder pool width per pass — a variable here; charter-weighted pooling lands in T2 |
+| N | `poolN` | finder pool width per pass — charter-weighted (see the pooling table above); `--n 1` (or unset) reproduces single-finder counts |
 | **finder calls** | **80·N – 320·N** | `8 × 5 × {2‥8} × N`; verification adds ≤1 repro + ≤1 verdict per surviving candidate |
 
 `--budget` is the hard ceiling: a call that would exceed it refuses and stops
@@ -161,9 +161,13 @@ packets already recorded dry — zero re-issued finder calls for them.
 | Var | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` | Provider credentials (autodetected in that order). |
+| `DOBETTER_LOCAL_BASE_URL` | Base URL of an OpenAI-compatible local endpoint (e.g. `http://localhost:11434/v1`) for `--provider local`. Autodetected last, after the hosted keys above. |
+| `DOBETTER_LOCAL_MODEL` | Model name to request from the local endpoint (e.g. `qwen2.5-coder`). |
+| `DOBETTER_LOCAL_API_KEY` | Optional bearer token for the local endpoint (many local servers ignore it). |
 | `DOBETTER_ADLC_DIR` | Path to an aidlc checkout for the composed tools (else sibling-dir probe, else `npx @adlc/<tool>`). |
 | `DOBETTER_SKILL_MINING_DIR` | Path to a skill-mining checkout (else sibling probe, else `npx skill-mining`). |
 | `DOBETTER_ANSWERS` | Path to a JSON `string[]` of scripted charter answers (non-interactive runs, CI, tests). |
+| `DOBETTER_FAKE_LLM` | Test seam: path to a module default-exporting an async `fake({prompt,system,tier,label,jsonMode})` — bypasses all providers/keys and no network path is reachable. |
 | `DOBETTER_DEBUG` | Print stack traces on error. |
 
 ## Artifact layout
