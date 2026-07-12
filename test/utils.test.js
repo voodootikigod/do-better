@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync as _spawnSync } from "node:child_process";
+const spawnSyncGit = (cwd, args) => _spawnSync("git", args, { cwd, encoding: "utf8" });
 import {
   BudgetError,
   COMMANDS,
@@ -16,6 +18,7 @@ import {
   isSafeRelPath,
   makeExec,
   mapLimit,
+  workingTreeStatus,
   nowIso,
   parseArgs,
   readJsonSafe,
@@ -294,4 +297,33 @@ test("gateError builds a well-formed GateError (H15 — no doubled message)", ()
   // garbled "Gate failed: roadmap: <detail> — <detail>".
   assert.equal(err.message, "Gate failed: roadmap — coldstart gaps persist in T1, T2");
   assert.doesNotMatch(err.message, /roadmap:/, "gate name is not doubled with the detail");
+});
+
+test("workingTreeStatus parses --porcelain: clean, dirty, and ignores .dobetter/ (H10/prosecutor)", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dobetter-wts-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const g = (args) => spawnSyncGit(dir, args);
+  g(["init", "-q"]);
+  fs.writeFileSync(path.join(dir, "a.txt"), "hi\n");
+  g(["add", "-A"]);
+  g(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+
+  // Clean tree — the --porcelain output is empty.
+  let s = workingTreeStatus(dir);
+  assert.deepEqual(s, { clean: true, dirtyCount: 0 });
+
+  // An uncommitted source change is dirty (this is the case that misattributes
+  // a citation) — a non-porcelain `git status` would count human header lines
+  // even on a clean tree, so this pins the flag.
+  fs.writeFileSync(path.join(dir, "a.txt"), "hi there\n");
+  s = workingTreeStatus(dir);
+  assert.equal(s.clean, false);
+  assert.equal(s.dirtyCount, 1);
+
+  // do-better's OWN output dir is ignored — it is the artifact, not a source change.
+  g(["checkout", "--", "a.txt"]);
+  fs.mkdirSync(path.join(dir, ".dobetter"));
+  fs.writeFileSync(path.join(dir, ".dobetter", "state.json"), "{}\n");
+  s = workingTreeStatus(dir);
+  assert.deepEqual(s, { clean: true, dirtyCount: 0 }, ".dobetter/ output does not mark the tree dirty");
 });

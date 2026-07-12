@@ -39,6 +39,8 @@ function fakeEnv(fakePath, extra = {}) {
   return { DOBETTER_FAKE_LLM: fakePath, ...extra };
 }
 
+const RETRY_ATTEMPTS = 3; // mirrors src/llm.js
+const estTokens = (s) => Math.ceil(String(s).length / 4);
 const tripwireFetch = () => {
   throw new Error("network touched — fetch must be unreachable in tests");
 };
@@ -547,4 +549,41 @@ test("H4: a billed-but-unparseable 200 records the billed spend and does not ret
   const spend = llm.drainSpend();
   assert.equal(spend.tokensIn, 12, "the billed input tokens were recorded, not lost");
   assert.ok(spend.costUSD > 0, "billed spend reaches the budget counter");
+});
+
+test("H2: a call that RESERVES then throws releases the reservation (prosecutor gap)", async () => {
+  // First call reserves, then its fetch fails on every attempt → OpError. If the
+  // finally did not release on the throw path, the leaked reservation would
+  // wrongly refuse the second (in-budget) call with a BudgetError.
+  const haiku = PRICES[DEFAULT_MODELS.anthropic.cheap];
+  const projection = (estTokens("hi") / 1e6) * haiku.in + (MAX_OUTPUT_TOKENS / 1e6) * haiku.out;
+  const limit = projection * 1.9; // room for ~one reservation at a time, not two
+  let n = 0;
+  const fetchImpl = async () => {
+    n += 1;
+    if (n <= RETRY_ATTEMPTS) throw new Error("network down"); // call 1's attempts all fail
+    return { ok: true, json: async () => ({ content: [{ text: "ok" }], usage: { input_tokens: 1, output_tokens: 1 } }) };
+  };
+  const llm = createLLM({
+    flags: { provider: "anthropic", budget: limit }, env: { ANTHROPIC_API_KEY: "k" },
+    fetchImpl, sleepImpl: async () => {},
+  });
+  await assert.rejects(llm.call("hi", { tier: "cheap", label: "t" }), OpError); // reserves, then throws
+  // The reservation must have been released — this in-budget call must SUCCEED.
+  assert.equal(await llm.call("hi", { tier: "cheap", label: "t" }), "ok", "second call not refused → reservation released on the throw path");
+});
+
+test("H4: a network error (no HTTP status) is retryable and exhausts to OpError", async () => {
+  // The isRetryable "no status → retry" branch: a fetch that THROWS (transport
+  // failure) must retry RETRY_ATTEMPTS times, unlike a permanent 4xx.
+  const sleeps = [];
+  let n = 0;
+  const fetchImpl = async () => { n += 1; throw new Error("ECONNRESET"); };
+  const llm = createLLM({
+    flags: { provider: "anthropic" }, env: { ANTHROPIC_API_KEY: "k" },
+    fetchImpl, sleepImpl: async (ms) => { sleeps.push(ms); },
+  });
+  await assert.rejects(llm.call("hi", { tier: "mid", label: "t" }), OpError);
+  assert.equal(n, RETRY_ATTEMPTS, "a network error retries the full attempt budget");
+  assert.deepEqual(sleeps, [1000, 2000], "backoff between the network-error retries");
 });
