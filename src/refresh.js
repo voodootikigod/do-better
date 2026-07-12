@@ -3,7 +3,7 @@
 // behavior-diff regression hook, mark roadmap items done/regressed.
 import fs from "node:fs";
 import path from "node:path";
-import { OpError, GateError, git, gitHeadSha, sha256Hex } from "./utils.js";
+import { OpError, gateError, git, gitHeadSha, sha256Hex } from "./utils.js";
 import { recordPhase, addSpend, pinSha, recordRoadmapHash } from "./state.js";
 import {
   LAYOUT, readArtifact, writeArtifact, readFindings, annotateStale, verifyCitations,
@@ -38,11 +38,7 @@ function finishState(state, ctx, { headSha, status, changedFiles, staleClaims })
 }
 
 function gateFail(state, gate, detail) {
-  const err = new GateError(`${gate}: ${detail}`, detail);
-  err.gate = gate;
-  err.detail = detail;
-  err.state = state;
-  return err;
+  return gateError(gate, detail, state); // H15 — shared, well-formed message
 }
 
 function coerceJson(raw) {

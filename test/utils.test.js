@@ -11,6 +11,7 @@ import {
   OpError,
   TAXONOMY,
   assertSafeModelName,
+  gateError,
   git,
   isSafeRelPath,
   makeExec,
@@ -280,4 +281,17 @@ test("mapLimit propagates the first rejection after in-flight tasks settle", asy
 test("mapLimit handles empty input and clamps limit to >= 1", async () => {
   assert.deepEqual(await mapLimit([], 4, async () => 1), []);
   assert.deepEqual(await mapLimit([5, 6], 0, async (n) => n * 2), [10, 12]);
+});
+
+test("gateError builds a well-formed GateError (H15 — no doubled message)", () => {
+  const st = { marker: true };
+  const err = gateError("roadmap", "coldstart gaps persist in T1, T2", st);
+  assert.equal(err.gate, "roadmap");
+  assert.equal(err.detail, "coldstart gaps persist in T1, T2");
+  assert.equal(err.exitCode, 2);
+  assert.equal(err.state, st, "state is attached for the CLI to persist");
+  // The message must be "Gate failed: <gate> — <detail>" — NOT the pre-H15
+  // garbled "Gate failed: roadmap: <detail> — <detail>".
+  assert.equal(err.message, "Gate failed: roadmap — coldstart gaps persist in T1, T2");
+  assert.doesNotMatch(err.message, /roadmap:/, "gate name is not doubled with the detail");
 });

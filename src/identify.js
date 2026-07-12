@@ -4,7 +4,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import {
-  OpError, BudgetError, GateError, sha256Hex, isSafeRelPath, truncate,
+  OpError, BudgetError, gateError, sha256Hex, isSafeRelPath, truncate,
   readPackageFile, gitHeadSha, TAXONOMY, mapLimit, warnIfDirtyTree,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, nextFindingId } from "./state.js";
@@ -132,11 +132,8 @@ function patchPhase(state, phase, patch) {
   return { ...state, phases: { ...state.phases, [phase]: { ...state.phases[phase], ...patch } } };
 }
 
-function makeGateError(message, gate, detail) {
-  const err = new GateError(message);
-  err.gate = gate;
-  err.detail = detail;
-  return err;
+function makeGateError(_message, gate, detail) {
+  return gateError(gate, detail); // H15 — shared, well-formed message
 }
 
 function clamp01(n, dflt = 0.5) {

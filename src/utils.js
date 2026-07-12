@@ -94,6 +94,18 @@ export class GateError extends Error {
   }
 }
 
+// Single constructor for a gate failure (H15) — the ONE correct way to build a
+// GateError, replacing five divergent per-phase copies that misused the
+// `(gate, detail)` constructor (passing a pre-formatted `${gate}: ${detail}`
+// string as the gate arg produced garbled "Gate failed: X: Y — Y" messages).
+// Attaches `state` for the CLI to persist when supplied. Message is well-formed:
+// "Gate failed: <gate> — <detail>".
+export function gateError(gate, detail, state) {
+  const err = new GateError(gate, detail);
+  if (state !== undefined) err.state = state;
+  return err;
+}
+
 // ---------------------------------------------------------------------------
 // Commands + fixed taxonomy floor (D5 — order is canonical)
 // ---------------------------------------------------------------------------

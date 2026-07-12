@@ -3,7 +3,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import {
-  OpError, GateError, truncate, readPackageFile, gitHeadSha,
+  OpError, gateError, truncate, readPackageFile, gitHeadSha,
   writeFileAtomic, readJsonSafe, isSafeRelPath, mapLimit, warnIfDirtyTree,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha } from "./state.js";
@@ -114,11 +114,8 @@ function patchPhase(state, phase, patch) {
   return { ...state, phases: { ...state.phases, [phase]: { ...state.phases[phase], ...patch } } };
 }
 
-function makeGateError(message, gate, detail) {
-  const err = new GateError(message);
-  err.gate = gate;
-  err.detail = detail;
-  return err;
+function makeGateError(_message, gate, detail) {
+  return gateError(gate, detail); // H15 — shared, well-formed message
 }
 
 function enrichFacts(facts, root) {
