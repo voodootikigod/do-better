@@ -289,6 +289,14 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
   let spentBase = Number.isFinite(state?.budget?.spentUSD) ? state.budget.spentUSD : 0;
 
   const accumulated = { calls: 0, tokensIn: 0, tokensOut: 0, costUSD: 0 };
+  // In-flight budget reservations (H2): checkBudget adds a call's estimated cost
+  // here BEFORE the network round-trip and call() releases it in a finally after
+  // the actual spend is recorded. Because checkBudget is check-then-record,
+  // concurrent callers (H8 pooled finders / D1 readers; the coldstart repair
+  // Promise.all) would otherwise each pass the same spend snapshot and blow the
+  // hard --budget ceiling collectively. Always 0 at check time for a sequential
+  // caller, so this is a provable no-op outside concurrency.
+  let reserved = 0;
   let fakeFnPromise = null;
 
   function estimateTokens(text) {
@@ -308,10 +316,14 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
     return FALLBACK_PRICE;
   }
 
+  // Reserves the call's estimated cost against the cap and returns the amount
+  // reserved (0 when no limit), which call() releases in a finally. Counts
+  // in-flight reservations so overlapping calls cannot each pass the same
+  // snapshot (H2). Throws BudgetError without reserving when the cap is blown.
   function checkBudget(prompt, system, tier) {
-    if (limit === null) return;
+    if (limit === null) return 0;
     const price = priceFor(tier);
-    const spent = spentBase + accumulated.costUSD;
+    const spent = spentBase + accumulated.costUSD + reserved;
     const estCost =
       (estimateTokens(prompt + system) / 1e6) * price.in + (MAX_OUTPUT_TOKENS / 1e6) * price.out;
     if (spent + estCost > limit) {
@@ -320,6 +332,8 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
           `Re-run with a higher --budget to resume; state.json preserves completed work.`
       );
     }
+    reserved += estCost;
+    return estCost;
   }
 
   function recordSpend(tokensIn, tokensOut, tier) {
@@ -392,17 +406,25 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
           `Wrap call sites with withFallback() or remove --offline.`
       );
     }
-    checkBudget(prompt, system, tier);
-    if (config.provider === "fake") {
-      const fake = await loadFake();
-      const text = await fake({ prompt, system, tier, label, jsonMode });
-      if (typeof text !== "string") {
-        throw new OpError(`${label}: DOBETTER_FAKE_LLM module returned a non-string response.`);
+    const reservedCost = checkBudget(prompt, system, tier);
+    try {
+      if (config.provider === "fake") {
+        const fake = await loadFake();
+        const text = await fake({ prompt, system, tier, label, jsonMode });
+        if (typeof text !== "string") {
+          throw new OpError(`${label}: DOBETTER_FAKE_LLM module returned a non-string response.`);
+        }
+        recordSpend(estimateTokens(prompt + system), estimateTokens(text), tier);
+        return text;
       }
-      recordSpend(estimateTokens(prompt + system), estimateTokens(text), tier);
-      return text;
+      return await callProvider(prompt, system, tier, jsonMode, label);
+    } finally {
+      // Release this call's reservation once it settles (success or throw). The
+      // actual spend is already in `accumulated` via recordSpend, so releasing
+      // the estimate avoids double-counting; a leak here would only err
+      // conservative, but the finally guarantees none.
+      reserved -= reservedCost;
     }
-    return callProvider(prompt, system, tier, jsonMode, label);
   }
 
   async function callJson(prompt, { system = "", tier = "mid", label = "LLM" } = {}) {

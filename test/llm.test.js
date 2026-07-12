@@ -335,6 +335,31 @@ test("budget is enforced across drainSpend cycles (cross-phase run does not forg
   await assert.rejects(llm.call(prompt, { tier: "cheap" }), BudgetError);
 });
 
+test("H2: concurrent calls reserve budget so they cannot collectively overshoot the cap", async () => {
+  // Two overlapping call() promises: each fits alone, but the pair exceeds the
+  // cap. Without a reservation both pass the check-then-record window and blow
+  // the ceiling; with it, the second sees the first's reservation and is
+  // refused. Regression guard for H8 concurrency safety.
+  const fakePath = writeFakeModule(FIXED_FAKE);
+  const haiku = PRICES[DEFAULT_MODELS.anthropic.cheap];
+  const projection = (100 / 1e6) * haiku.in + (MAX_OUTPUT_TOKENS / 1e6) * haiku.out;
+  const limit = projection * 1.5; // room for exactly ONE in-flight reservation
+
+  const llm = createLLM({ flags: { budget: limit }, env: fakeEnv(fakePath) });
+  const prompt = "x".repeat(400);
+  const settled = await Promise.allSettled([
+    llm.call(prompt, { tier: "cheap" }),
+    llm.call(prompt, { tier: "cheap" }),
+  ]);
+  const rejected = settled.filter((s) => s.status === "rejected");
+  assert.equal(rejected.length, 1, "exactly one of the two overlapping calls is refused");
+  assert.ok(rejected[0].reason instanceof BudgetError, "the refusal is a BudgetError");
+
+  // The reservation is released after the batch: a later sequential call sees no
+  // phantom reservation (only the one recorded actual remains, which fits).
+  await llm.call(prompt, { tier: "cheap" });
+});
+
 test("budget limit and prior spend come from state.json when no --budget flag", async () => {
   const fakePath = writeFakeModule(FIXED_FAKE);
   const state = { budget: { limitUSD: 0.05, spentUSD: 0.04 } };
