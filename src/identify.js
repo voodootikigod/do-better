@@ -4,8 +4,8 @@
 import path from "node:path";
 import fs from "node:fs";
 import {
-  OpError, BudgetError, GateError, sha256Hex, isSafeRelPath, truncate,
-  readPackageFile, gitHeadSha, TAXONOMY,
+  OpError, BudgetError, gateError, sha256Hex, isSafeRelPath, truncate,
+  readPackageFile, gitHeadSha, TAXONOMY, mapLimit, warnIfDirtyTree,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, nextFindingId } from "./state.js";
 import { LAYOUT, readArtifact, readFindings, runReproCheck, verifyCitations, writeArtifact, writeFinding } from "./artifacts.js";
@@ -132,11 +132,8 @@ function patchPhase(state, phase, patch) {
   return { ...state, phases: { ...state.phases, [phase]: { ...state.phases[phase], ...patch } } };
 }
 
-function makeGateError(message, gate, detail) {
-  const err = new GateError(message);
-  err.gate = gate;
-  err.detail = detail;
-  return err;
+function makeGateError(_message, gate, detail) {
+  return gateError(gate, detail); // H15 — shared, well-formed message
 }
 
 function clamp01(n, dflt = 0.5) {
@@ -462,6 +459,27 @@ function sanitizeRepro(obj, root) {
   return null;
 }
 
+// A repro is "demonstrative" — trustworthy enough to ALONE flip a candidate to
+// verified — only when it genuinely ties to the claim (H9). A repo-authored
+// test (`node --test`) and a grep with a SPECIFIC pattern qualify. A
+// model-proposed `node -e` snippet and a catch-all grep (matches virtually any
+// non-empty file) do NOT: they can pass without demonstrating anything, so a
+// candidate backed only by one is not verified on the command alone — it must
+// still earn a CONFIRM from the blind frontier verifier. As a bonus, a
+// non-demonstrative `node -e` is never executed here, removing that
+// prompt-injection surface (a hostile brownfield repo can no longer coax the
+// mid-tier proposer into running arbitrary code).
+const CATCHALL_GREP = new Set([".", ".*", ".+", ".*.*", "^", "$", "", "[\\s\\S]*", "\\S*", "\\s*", "\\w*", "[^]*"]);
+function isDemonstrativeRepro(repro) {
+  if (!repro) return false;
+  if (repro.kind === "test") return true;
+  if (repro.kind === "grep") {
+    const p = String(repro.pattern ?? "").trim();
+    return p.length > 0 && !CATCHALL_GREP.has(p);
+  }
+  return false; // eval (node -e): never demonstrative, and never run
+}
+
 function runRepro(root, repro, exec) {
   if (repro.kind === "grep") {
     const check = { type: "grep", pattern: repro.pattern, file: repro.file };
@@ -517,7 +535,10 @@ async function verifyCandidate(ctx, cand, head7) {
     if (e instanceof BudgetError) throw e;
     repro = null; // unparseable proposal → fall through to blind reread
   }
-  if (repro) {
+  // Only a DEMONSTRATIVE repro (H9) may alone verify — a non-demonstrative one
+  // (model `node -e`, catch-all grep) is ignored here and the candidate falls
+  // through to the blind reread, which must independently CONFIRM the claim.
+  if (repro && isDemonstrativeRepro(repro)) {
     const r = runRepro(root, repro, exec);
     if (r.exitCode === 0) {
       return {
@@ -533,7 +554,9 @@ async function verifyCandidate(ctx, cand, head7) {
     return { verified: false, reason: `reproduction command failed (exit ${r.exitCode})` };
   }
 
-  // b) blind frontier reread — proposer reasoning withheld (F2)
+  // b) blind frontier reread — proposer reasoning withheld (F2). Reached when no
+  // repro was proposed OR the proposal was non-demonstrative (H9): a
+  // trivially-passing check cannot alone verify a finding.
   try {
     const slice = codeSlice(root, cand.file, cand.line, 40);
     const obj = await jsonCall(llm, {
@@ -708,15 +731,26 @@ async function finderCell(ctx, { dim, packetText, pool, priorFixed, seen, base, 
       `Code under review:\n${packetText}\n\n` +
       'Return JSON {"candidates":[{"title":"...","claim":"...","file":"src/x.js","line":12,"severity":"critical|high|medium|low","confidence":0.8}]} — empty array if nothing new.';
     let newCount = 0;
-    for (let i = 0; i < poolWidth; i++) {
-      const lens = lenses[(passIndex + i) % lenses.length];
-      const system = `${base}\n\nLens: ${lens.text}`;
-      // A BudgetError from any pooled call rethrows immediately (stop-the-world,
-      // matching the single-finder contract); any other error, after the LLM
-      // layer's own retries, propagates and fails the phase (fail closed — a
-      // silently absent pool member would be undeclared coverage loss).
-      const obj = await jsonCall(llm, { prompt, system, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
-      const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
+    // The poolWidth finder calls in a pass differ ONLY by their lens and share
+    // one prompt/prior-conclusions context — they are independent, so run them
+    // concurrently (H8) with bounded concurrency = poolWidth. A BudgetError from
+    // any pooled call still rethrows stop-the-world (after in-flight siblings
+    // settle); any other error, after the LLM layer's own retries, propagates
+    // and fails the phase (fail closed — a silently absent pool member would be
+    // undeclared coverage loss). Admission below stays SEQUENTIAL in lens-index
+    // order, so seen/pool/semantic-dedupe ordering is identical to the previous
+    // one-at-a-time loop — the concurrency is wall-clock only, not behavioral.
+    const rawByLens = await mapLimit(
+      Array.from({ length: poolWidth }, (_, i) => i),
+      poolWidth,
+      async (i) => {
+        const lens = lenses[(passIndex + i) % lenses.length];
+        const system = `${base}\n\nLens: ${lens.text}`;
+        const obj = await jsonCall(llm, { prompt, system, tier: "mid", label: `finder:${dim.id}` }, () => ({ candidates: [] }));
+        return Array.isArray(obj) ? obj : Array.isArray(obj?.candidates) ? obj.candidates : [];
+      },
+    );
+    for (const raw of rawByLens) {
       for (const r of raw) {
         const cand = validateCandidate(r, dim.id, log);
         if (!cand) continue;
@@ -773,6 +807,7 @@ export async function run(ctx) {
     if (!charterArt) throw new OpError("Missing .dobetter/charter.md — run `do-better charter` first.");
     const headSha = gitHeadSha(root, exec);
     const head7 = headSha.slice(0, 7);
+    warnIfDirtyTree(root, exec, log, "D2 identify"); // H10 — declared, never silent
     const offline = llm.offline === true;
     // Progress (H16): D2 is one of the two heaviest phases and previously ran
     // in silence for tens of minutes. Announce the phase; per-cell steps below.

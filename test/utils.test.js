@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync as _spawnSync } from "node:child_process";
+const spawnSyncGit = (cwd, args) => _spawnSync("git", args, { cwd, encoding: "utf8" });
 import {
   BudgetError,
   COMMANDS,
@@ -11,9 +13,12 @@ import {
   OpError,
   TAXONOMY,
   assertSafeModelName,
+  gateError,
   git,
   isSafeRelPath,
   makeExec,
+  mapLimit,
+  workingTreeStatus,
   nowIso,
   parseArgs,
   readJsonSafe,
@@ -238,4 +243,87 @@ test("readPackageFile resolves relative to the do-better package root", () => {
   const pkg = readPackageFile("package.json");
   assert.match(pkg, /"name": "do-better"/);
   assert.throws(() => readPackageFile("no/such/file.md"), OpError);
+});
+
+// --- mapLimit (H8 bounded concurrency) ---------------------------------------
+
+test("mapLimit preserves INPUT order regardless of completion order", async () => {
+  // Later items resolve sooner; results must still match input order.
+  const out = await mapLimit([30, 10, 20], 3, (ms, i) =>
+    new Promise((r) => setTimeout(() => r(`${i}:${ms}`), ms)));
+  assert.deepEqual(out, ["0:30", "1:10", "2:20"]);
+});
+
+test("mapLimit never exceeds the concurrency limit", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const fn = async () => {
+    inFlight++; peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return null;
+  };
+  await mapLimit([1, 2, 3, 4, 5, 6, 7], 2, fn);
+  assert.ok(peak <= 2, `peak concurrency ${peak} must not exceed 2`);
+  assert.ok(peak >= 1);
+});
+
+test("mapLimit propagates the first rejection after in-flight tasks settle", async () => {
+  const settled = [];
+  await assert.rejects(
+    mapLimit([1, 2, 3], 2, async (n) => {
+      if (n === 2) throw new Error("boom-2");
+      await new Promise((r) => setTimeout(r, 3));
+      settled.push(n);
+      return n;
+    }),
+    (err) => err instanceof Error && /boom-2/.test(err.message),
+  );
+});
+
+test("mapLimit handles empty input and clamps limit to >= 1", async () => {
+  assert.deepEqual(await mapLimit([], 4, async () => 1), []);
+  assert.deepEqual(await mapLimit([5, 6], 0, async (n) => n * 2), [10, 12]);
+});
+
+test("gateError builds a well-formed GateError (H15 — no doubled message)", () => {
+  const st = { marker: true };
+  const err = gateError("roadmap", "coldstart gaps persist in T1, T2", st);
+  assert.equal(err.gate, "roadmap");
+  assert.equal(err.detail, "coldstart gaps persist in T1, T2");
+  assert.equal(err.exitCode, 2);
+  assert.equal(err.state, st, "state is attached for the CLI to persist");
+  // The message must be "Gate failed: <gate> — <detail>" — NOT the pre-H15
+  // garbled "Gate failed: roadmap: <detail> — <detail>".
+  assert.equal(err.message, "Gate failed: roadmap — coldstart gaps persist in T1, T2");
+  assert.doesNotMatch(err.message, /roadmap:/, "gate name is not doubled with the detail");
+});
+
+test("workingTreeStatus parses --porcelain: clean, dirty, and ignores .dobetter/ (H10/prosecutor)", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dobetter-wts-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const g = (args) => spawnSyncGit(dir, args);
+  g(["init", "-q"]);
+  fs.writeFileSync(path.join(dir, "a.txt"), "hi\n");
+  g(["add", "-A"]);
+  g(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+
+  // Clean tree — the --porcelain output is empty.
+  let s = workingTreeStatus(dir);
+  assert.deepEqual(s, { clean: true, dirtyCount: 0 });
+
+  // An uncommitted source change is dirty (this is the case that misattributes
+  // a citation) — a non-porcelain `git status` would count human header lines
+  // even on a clean tree, so this pins the flag.
+  fs.writeFileSync(path.join(dir, "a.txt"), "hi there\n");
+  s = workingTreeStatus(dir);
+  assert.equal(s.clean, false);
+  assert.equal(s.dirtyCount, 1);
+
+  // do-better's OWN output dir is ignored — it is the artifact, not a source change.
+  g(["checkout", "--", "a.txt"]);
+  fs.mkdirSync(path.join(dir, ".dobetter"));
+  fs.writeFileSync(path.join(dir, ".dobetter", "state.json"), "{}\n");
+  s = workingTreeStatus(dir);
+  assert.deepEqual(s, { clean: true, dirtyCount: 0 }, ".dobetter/ output does not mark the tree dirty");
 });

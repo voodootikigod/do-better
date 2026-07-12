@@ -39,6 +39,8 @@ function fakeEnv(fakePath, extra = {}) {
   return { DOBETTER_FAKE_LLM: fakePath, ...extra };
 }
 
+const RETRY_ATTEMPTS = 3; // mirrors src/llm.js
+const estTokens = (s) => Math.ceil(String(s).length / 4);
 const tripwireFetch = () => {
   throw new Error("network touched — fetch must be unreachable in tests");
 };
@@ -335,6 +337,31 @@ test("budget is enforced across drainSpend cycles (cross-phase run does not forg
   await assert.rejects(llm.call(prompt, { tier: "cheap" }), BudgetError);
 });
 
+test("H2: concurrent calls reserve budget so they cannot collectively overshoot the cap", async () => {
+  // Two overlapping call() promises: each fits alone, but the pair exceeds the
+  // cap. Without a reservation both pass the check-then-record window and blow
+  // the ceiling; with it, the second sees the first's reservation and is
+  // refused. Regression guard for H8 concurrency safety.
+  const fakePath = writeFakeModule(FIXED_FAKE);
+  const haiku = PRICES[DEFAULT_MODELS.anthropic.cheap];
+  const projection = (100 / 1e6) * haiku.in + (MAX_OUTPUT_TOKENS / 1e6) * haiku.out;
+  const limit = projection * 1.5; // room for exactly ONE in-flight reservation
+
+  const llm = createLLM({ flags: { budget: limit }, env: fakeEnv(fakePath) });
+  const prompt = "x".repeat(400);
+  const settled = await Promise.allSettled([
+    llm.call(prompt, { tier: "cheap" }),
+    llm.call(prompt, { tier: "cheap" }),
+  ]);
+  const rejected = settled.filter((s) => s.status === "rejected");
+  assert.equal(rejected.length, 1, "exactly one of the two overlapping calls is refused");
+  assert.ok(rejected[0].reason instanceof BudgetError, "the refusal is a BudgetError");
+
+  // The reservation is released after the batch: a later sequential call sees no
+  // phantom reservation (only the one recorded actual remains, which fits).
+  await llm.call(prompt, { tier: "cheap" });
+});
+
 test("budget limit and prior spend come from state.json when no --budget flag", async () => {
   const fakePath = writeFakeModule(FIXED_FAKE);
   const state = { budget: { limitUSD: 0.05, spentUSD: 0.04 } };
@@ -461,4 +488,102 @@ test("H5: gemini request builder — url, systemInstruction, responseMimeType on
   const spend = llm.drainSpend();
   assert.equal(spend.tokensIn, 7, "parse() reads usageMetadata.promptTokenCount");
   assert.equal(spend.tokensOut, 2, "parse() reads usageMetadata.candidatesTokenCount");
+});
+
+// ── H3/H4: callProvider retry classification, backoff, spend accounting ──────
+// Driven through a request-capturing fetchImpl + an injected sleepImpl spy, so
+// the reliability layer for every online call is tested without real delays.
+
+function anthropicLLM({ fetchImpl, sleeps }) {
+  return createLLM({
+    flags: { provider: "anthropic" },
+    env: { ANTHROPIC_API_KEY: "k" },
+    fetchImpl,
+    sleepImpl: async (ms) => { sleeps.push(ms); },
+  });
+}
+const okBody = (text = "ok") => ({ ok: true, json: async () => ({ content: [{ text }], usage: { input_tokens: 5, output_tokens: 2 } }) });
+const httpErr = (status) => ({ ok: false, status, text: async () => `error ${status}` });
+
+test("H4: retry-then-succeed on attempt 2 records spend once and sleeps once", async () => {
+  const sleeps = [];
+  let n = 0;
+  const fetchImpl = async () => (++n === 1 ? httpErr(503) : okBody("pong"));
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  assert.equal(await llm.call("hi", { tier: "mid", label: "t" }), "pong");
+  assert.equal(n, 2, "second attempt succeeded");
+  assert.deepEqual(sleeps, [1000], "one backoff sleep before the retry");
+  assert.equal(llm.drainSpend().calls, 1, "spend recorded exactly once");
+});
+
+test("H4: exhaustion throws OpError naming provider/model after RETRY_ATTEMPTS", async () => {
+  const sleeps = [];
+  const fetchImpl = async () => httpErr(503);
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  await assert.rejects(
+    llm.call("hi", { tier: "mid", label: "t" }),
+    (err) => err instanceof OpError && /anthropic\//.test(err.message) && /after 3 attempts/.test(err.message),
+  );
+  assert.deepEqual(sleeps, [1000, 2000], "backoff doubles across the two inter-attempt sleeps");
+});
+
+test("H4: a permanent 400 fails after ONE attempt with no retry sleeps", async () => {
+  const sleeps = [];
+  let n = 0;
+  const fetchImpl = async () => { n++; return httpErr(400); };
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  await assert.rejects(llm.call("hi", { tier: "mid", label: "t" }), OpError);
+  assert.equal(n, 1, "no retry on a non-retryable 4xx");
+  assert.deepEqual(sleeps, [], "no backoff sleeps for a permanent error");
+});
+
+test("H4: a billed-but-unparseable 200 records the billed spend and does not retry", async () => {
+  const sleeps = [];
+  let n = 0;
+  // 200 OK, tokens billed (usage present), but no content[0].text → parse throws.
+  const fetchImpl = async () => { n++; return { ok: true, json: async () => ({ usage: { input_tokens: 12 }, note: "safety-blocked" }) }; };
+  const llm = anthropicLLM({ fetchImpl, sleeps });
+  await assert.rejects(llm.call("hi", { tier: "mid", label: "t" }), OpError);
+  assert.equal(n, 1, "billed-but-unparseable is not retried (would only re-bill)");
+  assert.deepEqual(sleeps, []);
+  const spend = llm.drainSpend();
+  assert.equal(spend.tokensIn, 12, "the billed input tokens were recorded, not lost");
+  assert.ok(spend.costUSD > 0, "billed spend reaches the budget counter");
+});
+
+test("H2: a call that RESERVES then throws releases the reservation (prosecutor gap)", async () => {
+  // First call reserves, then its fetch fails on every attempt → OpError. If the
+  // finally did not release on the throw path, the leaked reservation would
+  // wrongly refuse the second (in-budget) call with a BudgetError.
+  const haiku = PRICES[DEFAULT_MODELS.anthropic.cheap];
+  const projection = (estTokens("hi") / 1e6) * haiku.in + (MAX_OUTPUT_TOKENS / 1e6) * haiku.out;
+  const limit = projection * 1.9; // room for ~one reservation at a time, not two
+  let n = 0;
+  const fetchImpl = async () => {
+    n += 1;
+    if (n <= RETRY_ATTEMPTS) throw new Error("network down"); // call 1's attempts all fail
+    return { ok: true, json: async () => ({ content: [{ text: "ok" }], usage: { input_tokens: 1, output_tokens: 1 } }) };
+  };
+  const llm = createLLM({
+    flags: { provider: "anthropic", budget: limit }, env: { ANTHROPIC_API_KEY: "k" },
+    fetchImpl, sleepImpl: async () => {},
+  });
+  await assert.rejects(llm.call("hi", { tier: "cheap", label: "t" }), OpError); // reserves, then throws
+  // The reservation must have been released — this in-budget call must SUCCEED.
+  assert.equal(await llm.call("hi", { tier: "cheap", label: "t" }), "ok", "second call not refused → reservation released on the throw path");
+});
+
+test("H4: a network error (no HTTP status) is retryable and exhausts to OpError", async () => {
+  // The isRetryable "no status → retry" branch: a fetch that THROWS (transport
+  // failure) must retry RETRY_ATTEMPTS times, unlike a permanent 4xx.
+  const sleeps = [];
+  let n = 0;
+  const fetchImpl = async () => { n += 1; throw new Error("ECONNRESET"); };
+  const llm = createLLM({
+    flags: { provider: "anthropic" }, env: { ANTHROPIC_API_KEY: "k" },
+    fetchImpl, sleepImpl: async (ms) => { sleeps.push(ms); },
+  });
+  await assert.rejects(llm.call("hi", { tier: "mid", label: "t" }), OpError);
+  assert.equal(n, RETRY_ATTEMPTS, "a network error retries the full attempt budget");
+  assert.deepEqual(sleeps, [1000, 2000], "backoff between the network-error retries");
 });

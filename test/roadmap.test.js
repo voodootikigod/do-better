@@ -450,3 +450,44 @@ test("approve: missing ROADMAP.md is an operational error", async () => {
   const state = seedState(root, (s) => setGate(s, "roadmap", { coldstartClean: true }));
   await assert.rejects(approve(makeCtx(root, { state })), (err) => err instanceof OpError && /ROADMAP/.test(err.message));
 });
+
+test("H14: coldstart tool absent + online — a failing native probe fails the gate (exit 2, degraded=native-probe)", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  const dotdir = path.join(root, ".dobetter");
+  seedCharter(dotdir);
+  writeFinding(dotdir, finding(root, "F-SEC-0001", "security"));
+  const llm = makeFakeLLM({
+    score: { items: [{ id: "F-SEC-0001", impact: "L", effort: "S", confidence: 0.9 }] },
+    "ticket:T1": TICKET_JSON("Fix it"),
+    "ticket-repair": TICKET_JSON("Fix it (repaired)"),
+    // The native fresh-agent probe reports a blocking gap every round.
+    "coldstart-probe": { pass: false, gaps: [{ what: "vague scope", why_blocking: "unbounded" }] },
+  });
+  // coldstart tool ABSENT (default availability) → the degraded native probe runs.
+  const ctx = makeCtx(root, { state: seedState(root), llm });
+  await assert.rejects(run(ctx), (err) => {
+    assert.ok(err instanceof GateError, "GateError thrown when native-probe gaps persist");
+    assert.equal(err.exitCode, 2);
+    assert.equal(err.gate, "roadmap");
+    assert.equal(err.state.gates.roadmap.coldstartClean, false);
+    assert.equal(err.state.gates.roadmap.coldstartDegraded, "native-probe", "the degradation is declared on the gate record");
+    return true;
+  });
+  const t1 = readArtifact(dotdir, "backlog/T1.md");
+  assert.match(t1.body, /coldstart: failed/, "the gapped ticket is flagged, never silently shipped");
+});
+
+test("H14: coldstart tool absent + offline — degrades to static-lint, gate passes with degradation declared", async () => {
+  const root = makeRepo(FIXTURE_FILES);
+  const dotdir = path.join(root, ".dobetter");
+  seedCharter(dotdir);
+  writeFinding(dotdir, finding(root, "F-SEC-0001", "security"));
+  // Offline llm: every LLM call degrades to its deterministic fallback, and
+  // coldstart routes through validateTicket (static lint) rather than a probe.
+  const llm = { ...makeFakeLLM({}), offline: true };
+  const ctx = makeCtx(root, { state: seedState(root), llm, flags: { offline: true } });
+  const result = await run(ctx);
+  assert.equal(result.state.gates.roadmap.coldstartClean, true, "deterministic tickets pass static lint");
+  assert.equal(result.state.gates.roadmap.coldstartDegraded, "static-lint", "the offline degradation is declared, never silent");
+  assert.match(result.summary, /coldstart degraded: static-lint/);
+});

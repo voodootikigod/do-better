@@ -261,9 +261,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Retry only transient failures (H3): network errors (no HTTP status), request
+// timeout (408), rate limit (429), and 5xx. A permanent 4xx (400 bad request,
+// 401/403 auth, 404 model, 422 unprocessable) or a response-parse failure is
+// not worth re-issuing — it fails the same way and only burns backoff sleeps
+// (and, for a billed-but-unparseable body, re-bills). `err.status` is attached
+// at the non-ok throw site; its absence means a network/transport error.
+function isRetryable(err) {
+  const s = err?.status;
+  if (typeof s !== "number") return true; // network / transport — worth retrying
+  return s === 408 || s === 429 || s >= 500;
+}
+
 // Create the LLM service object — the ONE sanctioned mutable accumulator
 // (spend). Never returns null; offline still constructs.
-export function createLLM({ flags = {}, state = null, env = process.env, fetchImpl = globalThis.fetch } = {}) {
+export function createLLM({ flags = {}, state = null, env = process.env, fetchImpl = globalThis.fetch, sleepImpl = sleep } = {}) {
   const fakePath = env.DOBETTER_FAKE_LLM || null;
   // Test seam: when DOBETTER_FAKE_LLM is set, providers/keys are ignored
   // entirely and no network code path is reachable.
@@ -289,6 +301,14 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
   let spentBase = Number.isFinite(state?.budget?.spentUSD) ? state.budget.spentUSD : 0;
 
   const accumulated = { calls: 0, tokensIn: 0, tokensOut: 0, costUSD: 0 };
+  // In-flight budget reservations (H2): checkBudget adds a call's estimated cost
+  // here BEFORE the network round-trip and call() releases it in a finally after
+  // the actual spend is recorded. Because checkBudget is check-then-record,
+  // concurrent callers (H8 pooled finders / D1 readers; the coldstart repair
+  // Promise.all) would otherwise each pass the same spend snapshot and blow the
+  // hard --budget ceiling collectively. Always 0 at check time for a sequential
+  // caller, so this is a provable no-op outside concurrency.
+  let reserved = 0;
   let fakeFnPromise = null;
 
   function estimateTokens(text) {
@@ -308,10 +328,14 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
     return FALLBACK_PRICE;
   }
 
+  // Reserves the call's estimated cost against the cap and returns the amount
+  // reserved (0 when no limit), which call() releases in a finally. Counts
+  // in-flight reservations so overlapping calls cannot each pass the same
+  // snapshot (H2). Throws BudgetError without reserving when the cap is blown.
   function checkBudget(prompt, system, tier) {
-    if (limit === null) return;
+    if (limit === null) return 0;
     const price = priceFor(tier);
-    const spent = spentBase + accumulated.costUSD;
+    const spent = spentBase + accumulated.costUSD + reserved;
     const estCost =
       (estimateTokens(prompt + system) / 1e6) * price.in + (MAX_OUTPUT_TOKENS / 1e6) * price.out;
     if (spent + estCost > limit) {
@@ -320,6 +344,8 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
           `Re-run with a higher --budget to resume; state.json preserves completed work.`
       );
     }
+    reserved += estCost;
+    return estCost;
   }
 
   function recordSpend(tokensIn, tokensOut, tier) {
@@ -356,18 +382,37 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
         });
         if (!res.ok) {
           const errText = await res.text();
-          throw new Error(`${config.provider} API error (${res.status}): ${errText}`);
+          const httpErr = new Error(`${config.provider} API error (${res.status}): ${errText}`);
+          httpErr.status = res.status; // lets isRetryable classify 4xx vs 5xx
+          throw httpErr;
         }
         const data = await res.json();
-        const { text, tokensIn, tokensOut } = req.parse(data);
+        let parsed;
+        try {
+          parsed = req.parse(data);
+        } catch (parseErr) {
+          // Billed-but-unparseable (H3): the provider returned 200 and charged
+          // for the tokens, but the body has no usable text (e.g. a
+          // safety-blocked Gemini candidate, an OpenAI refusal shape). Record
+          // the billed spend BEFORE failing so it never escapes the budget
+          // counter, and mark the error non-retryable (the same body reparses
+          // the same way — retrying only re-bills).
+          recordSpend(intOrNull(data?.usage?.input_tokens ?? data?.usage?.prompt_tokens ?? data?.usageMetadata?.promptTokenCount) ?? estimateTokens(prompt + system), 0, tier);
+          parseErr.status = 200;
+          throw parseErr;
+        }
+        const { text, tokensIn, tokensOut } = parsed;
         recordSpend(tokensIn ?? estimateTokens(prompt + system), tokensOut ?? estimateTokens(text), tier);
         return text;
       } catch (err) {
         lastErr = err;
-        if (attempt < RETRY_ATTEMPTS) {
+        if (attempt < RETRY_ATTEMPTS && isRetryable(err)) {
           log.warn(`${label}: LLM call failed (attempt ${attempt}/${RETRY_ATTEMPTS}): ${err.message} — retrying in ${delay}ms`);
-          await sleep(delay);
+          await sleepImpl(delay);
           delay *= 2;
+        } else if (!isRetryable(err)) {
+          // Permanent failure — stop immediately, do not burn further attempts.
+          break;
         }
       }
     }
@@ -392,17 +437,25 @@ export function createLLM({ flags = {}, state = null, env = process.env, fetchIm
           `Wrap call sites with withFallback() or remove --offline.`
       );
     }
-    checkBudget(prompt, system, tier);
-    if (config.provider === "fake") {
-      const fake = await loadFake();
-      const text = await fake({ prompt, system, tier, label, jsonMode });
-      if (typeof text !== "string") {
-        throw new OpError(`${label}: DOBETTER_FAKE_LLM module returned a non-string response.`);
+    const reservedCost = checkBudget(prompt, system, tier);
+    try {
+      if (config.provider === "fake") {
+        const fake = await loadFake();
+        const text = await fake({ prompt, system, tier, label, jsonMode });
+        if (typeof text !== "string") {
+          throw new OpError(`${label}: DOBETTER_FAKE_LLM module returned a non-string response.`);
+        }
+        recordSpend(estimateTokens(prompt + system), estimateTokens(text), tier);
+        return text;
       }
-      recordSpend(estimateTokens(prompt + system), estimateTokens(text), tier);
-      return text;
+      return await callProvider(prompt, system, tier, jsonMode, label);
+    } finally {
+      // Release this call's reservation once it settles (success or throw). The
+      // actual spend is already in `accumulated` via recordSpend, so releasing
+      // the estimate avoids double-counting; a leak here would only err
+      // conservative, but the finally guarantees none.
+      reserved -= reservedCost;
     }
-    return callProvider(prompt, system, tier, jsonMode, label);
   }
 
   async function callJson(prompt, { system = "", tier = "mid", label = "LLM" } = {}) {

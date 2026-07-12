@@ -39,6 +39,24 @@ export const log = {
   errorTrace: (err) => console.error(colors.dim(String((err && err.stack) || err))),
 };
 
+// Under --json (H17), decorative progress must NOT pollute stdout — stdout has
+// to carry ONLY the final JSON object so a CI wrapper can parse the whole
+// stream. This variant routes every human-facing line (including the ones phase
+// modules emit via ctx.log: phase/step/substep/success/info) to STDERR; warn
+// and error already go to stderr. Callers pass this as ctx.log when flags.json.
+export const stderrLog = {
+  info: (m) => console.error(`${colors.blue("ℹ")} ${m}`),
+  success: (m) => console.error(`${colors.green("✔")} ${m}`),
+  warn: log.warn,
+  error: log.error,
+  phase: (id, name) => console.error(colors.bold(colors.cyan(`\n=== ${id}: ${name} ===`))),
+  gate: (name, human) =>
+    console.error(colors.bold(colors.magenta(`\n=== ⟂ Gate: ${name}${human ? " (HUMAN)" : ""} ===`))),
+  step: (m) => console.error(`  ${m}`),
+  substep: (m) => console.error(colors.dim(`    ${m}`)),
+  errorTrace: log.errorTrace,
+};
+
 // ---------------------------------------------------------------------------
 // Error classes (exit-code contract: 0 success/human pause, 1 operational,
 // 2 deterministic gate failure)
@@ -74,6 +92,18 @@ export class GateError extends Error {
     this.gate = gate;
     this.detail = detail;
   }
+}
+
+// Single constructor for a gate failure (H15) — the ONE correct way to build a
+// GateError, replacing five divergent per-phase copies that misused the
+// `(gate, detail)` constructor (passing a pre-formatted `${gate}: ${detail}`
+// string as the gate arg produced garbled "Gate failed: X: Y — Y" messages).
+// Attaches `state` for the CLI to persist when supplied. Message is well-formed:
+// "Gate failed: <gate> — <detail>".
+export function gateError(gate, detail, state) {
+  const err = new GateError(gate, detail);
+  if (state !== undefined) err.state = state;
+  return err;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +348,41 @@ export function gitHeadSha(root, exec = makeExec()) {
   return git(root, ["rev-parse", "HEAD"], exec);
 }
 
+// Working-tree cleanliness (H10). All read phases pin citations to HEAD's sha
+// but read the WORKING TREE via fs; on a dirty tree those `file:line@sha` claims
+// are attributed to a commit that does not contain that content. Returns
+// { clean, dirtyCount }; a failed status probe is treated as clean (never
+// blocks a run — the warning is advisory, degrade loudly not fatally).
+export function workingTreeStatus(root, exec = makeExec()) {
+  const r = exec("git", ["status", "--porcelain"], { cwd: root });
+  if (r.status !== 0) return { clean: true, dirtyCount: 0 };
+  const lines = (r.stdout ?? "").split("\n").filter((l) => {
+    if (l.trim() === "") return false;
+    // Ignore do-better's OWN output dir (.dobetter/) — it is the artifact of the
+    // run, not a source change that would misattribute a citation, and it would
+    // otherwise flag every re-run as "dirty".
+    const p = l.slice(3).replace(/^"|"$/g, "");
+    return !(p === ".dobetter" || p.startsWith(".dobetter/"));
+  });
+  return { clean: lines.length === 0, dirtyCount: lines.length };
+}
+
+// A one-line declared warning that a phase is minting @sha citations against a
+// dirty working tree (H10) — "declared, never silent" per the doctrine. Emits
+// via log.warn when dirty; a no-op when clean. Returns the status for callers
+// that want to record it.
+export function warnIfDirtyTree(root, exec, log, phaseLabel) {
+  const status = workingTreeStatus(root, exec);
+  if (!status.clean) {
+    log?.warn?.(
+      `${phaseLabel}: working tree has ${status.dirtyCount} uncommitted change(s) — ` +
+      "file:line@sha citations are pinned to HEAD but read from the working tree, " +
+      "so claims may not match the committed blob. Commit before a citable run for exact provenance.",
+    );
+  }
+  return status;
+}
+
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------
@@ -343,6 +408,35 @@ export function truncate(text, maxChars) {
   const s = String(text);
   if (s.length <= maxChars) return s;
   return `${s.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+// Zero-dep bounded-concurrency map (H8). Runs `fn(item, index)` over `items`
+// with at most `limit` in flight, returns results in INPUT order (never
+// completion order), and on the first rejection stops pulling new work, lets
+// the in-flight tasks settle, then rejects with that first error. limit is
+// clamped to >= 1. Used to fan out independent LLM calls (D2 pooled finders,
+// D1 readers) without changing result ordering or gate semantics.
+export async function mapLimit(items, limit, fn) {
+  const arr = Array.from(items);
+  const results = new Array(arr.length);
+  const lim = Math.max(1, Math.trunc(Number(limit)) || 1);
+  let next = 0;
+  let firstErr = null;
+  async function worker() {
+    while (next < arr.length && firstErr === null) {
+      const i = next++;
+      try {
+        results[i] = await fn(arr[i], i);
+      } catch (err) {
+        if (firstErr === null) firstErr = err;
+      }
+    }
+  }
+  const workers = [];
+  for (let w = 0; w < Math.min(lim, arr.length); w++) workers.push(worker());
+  await Promise.all(workers);
+  if (firstErr !== null) throw firstErr;
+  return results;
 }
 
 // Resolve a file relative to THIS package's root (not the target repo) — used

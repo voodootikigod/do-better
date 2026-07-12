@@ -2,7 +2,7 @@
 // coldstart gate; human approval gate 2. See SPEC §2 (D3), blueprint §7 D3.
 import fs from "node:fs";
 import path from "node:path";
-import { OpError, GateError, sha256Hex, gitHeadSha, readPackageFile, truncate } from "./utils.js";
+import { OpError, gateError, sha256Hex, gitHeadSha, readPackageFile, truncate } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, recordRoadmapHash } from "./state.js";
 import {
   LAYOUT, ensureLayout, readArtifact, writeArtifact, readFindings,
@@ -191,11 +191,7 @@ function coerceJson(raw, label) {
 }
 
 function gateFail(state, gate, detail) {
-  const err = new GateError(`${gate}: ${detail}`, detail);
-  err.gate = gate;
-  err.detail = detail;
-  err.state = state;
-  return err;
+  return gateError(gate, detail, state); // H15 — shared, well-formed message
 }
 
 // ---------- living-document reconciliation (D6) ----------

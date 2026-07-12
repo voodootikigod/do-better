@@ -406,3 +406,57 @@ test("lens-catalog clamp: --n 8 on a weight-5 dimension issues at most 5 calls p
     assert.equal(systems.size, passCalls.length, "every pooled call in one pass has a distinct system prompt (distinct lens)");
   }
 });
+
+// ---------------------------------------------------------------------------
+// H8 determinism (prosecutor gap) — the concurrent finder pool must ADMIT
+// candidates in lens-index order, so finding IDs are reproducible regardless of
+// which pooled call resolves first. The fake keys candidates on LENS TEXT (not
+// a call counter), so the mapping lens→candidate is fixed; only the admission
+// order can vary, and it must stay lens-0-before-lens-1. A reverse-admission
+// regression flips the finding IDs and fails this test.
+// ---------------------------------------------------------------------------
+test("H8 determinism: pooled findings are admitted in lens-index order (lens 0 → first id)", async (t) => {
+  const { root, dotdir, headSha } = makeRepo(t);
+  const weights = weightsWith({ security: 5 });
+  writeComprehensionInputs(dotdir, headSha, weights);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dobetter-pool-detfake-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fakeFile = path.join(dir, "fake.mjs");
+  fs.writeFileSync(fakeFile, [
+    "export default async function fake({ system = '', label = '' }) {",
+    "  if (label === 'verdict') return JSON.stringify({ verdict: 'CONFIRM', reason: 'ok' });",
+    "  if (label === 'repro-cmd') return JSON.stringify({ reproCmd: null });",
+    "  if (typeof label === 'string' && label.startsWith('finder:')) {",
+    // lens 0 for pass 0 is exploit-author ('as an attacker'); lens 1 is oncall-3am ('the pager just woke').
+    "    if (system.includes('attacker-controlled data')) return JSON.stringify({ candidates: [{ title: 'ALPHA lens0', claim: 'alpha distinct claim', file: 'src/util.js', line: 1, severity: 'high', confidence: 0.8 }] });",
+    "    if (system.includes('the pager just woke')) return JSON.stringify({ candidates: [{ title: 'BETA lens1', claim: 'beta distinct claim', file: 'src/util.js', line: 2, severity: 'high', confidence: 0.8 }] });",
+    "    return JSON.stringify({ candidates: [] });",
+    "  }",
+    "  return '{}';",
+    "}",
+  ].join("\n"));
+
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY; delete env.OPENAI_API_KEY; delete env.GEMINI_API_KEY;
+  env.DOBETTER_FAKE_LLM = fakeFile;
+  const flags = {
+    command: "audit", target: root, provider: null, budget: null, offline: false,
+    modelCheap: "claude-haiku-4-5", modelMid: "claude-sonnet-4-6", modelFrontier: "claude-opus-4-8",
+    n: 2, threshold: null, approve: false, yes: false, json: false, help: false,
+  };
+  const llm = llmMod.createLLM({ flags, state: prepState({ headSha, weights }), env });
+  const ctx = {
+    root, dotdir, state: prepState({ headSha, weights }), llm, adlc: ABSENT_ADLC, flags,
+    log: quietLog, now: () => new Date().toISOString(), exec: utils.makeExec(), ask: null,
+  };
+  const res = await identify.run(ctx);
+  assert.equal(res.gate.passed, true);
+
+  const sec = artifacts.readFindings(dotdir)
+    .filter((f) => f.dimension === "security")
+    .sort((a, b) => a.id.localeCompare(b.id));
+  assert.equal(sec.length, 2, "both distinct-lens candidates verified");
+  assert.equal(sec[0].title, "ALPHA lens0", "lens-0 candidate gets the FIRST finding id (admission is lens-index order)");
+  assert.equal(sec[1].title, "BETA lens1", "lens-1 candidate gets the SECOND finding id");
+});

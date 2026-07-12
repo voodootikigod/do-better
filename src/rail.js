@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  OpError, GateError, gitHeadSha, git, readJsonSafe, readPackageFile, writeFileAtomic, sha256Hex,
+  OpError, gateError, gitHeadSha, git, readJsonSafe, readPackageFile, writeFileAtomic, sha256Hex,
 } from "./utils.js";
 import { recordPhase, addSpend, setGate, pinSha, recordRoadmapHash } from "./state.js";
 import {
@@ -116,11 +116,7 @@ function stripFences(text) {
 }
 
 function gateFail(state, gate, detail) {
-  const err = new GateError(`${gate}: ${detail}`, detail);
-  err.gate = gate;
-  err.detail = detail;
-  err.state = state;
-  return err;
+  return gateError(gate, detail, state); // H15 — shared, well-formed message
 }
 
 function patchPhase(state, patch) {

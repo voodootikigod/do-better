@@ -50,6 +50,16 @@ timeout, stdout/stderr and exit code recorded verbatim. The command
 demonstrating the claim succeeds → **verified**, `method: "command"`, the full
 record stored in the finding.
 
+**Only a _demonstrative_ check may alone verify (H9).** A check is demonstrative
+when it genuinely ties to the claim: a repo-authored `node --test <file>`, or a
+grep with a **specific** pattern. A model-proposed `node -e` snippet and a
+catch-all grep (`.`, `.*`, empty, and the like — patterns that match virtually
+any non-empty file) are **not** demonstrative: they can exit 0 without showing
+anything, so a candidate backed only by one is not verified on the command — it
+falls through to the blind re-read (Step 3), which must independently CONFIRM.
+A non-demonstrative `node -e` is never executed at all, removing that
+prompt-injection surface for hostile brownfield repos.
+
 ### Step 3 — Blind re-read (for non-runnable claims)
 
 Design and debt claims can't run. For these, a **fresh frontier context** —
