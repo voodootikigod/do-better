@@ -14,5 +14,7 @@
   "keywords": ["brownfield", "codebase-analysis", "roadmap", "characterization-tests", "adlc"],
   "author": "Chris Williams (@voodootikigod)",
   "license": "MIT",
-  "homepage": "https://github.com/voodootikigod/do-better"
+  "repository": { "type": "git", "url": "git+https://github.com/voodootikigod/do-better.git" },
+  "bugs": { "url": "https://github.com/voodootikigod/do-better/issues" },
+  "homepage": "https://github.com/voodootikigod/do-better#readme"
 }
