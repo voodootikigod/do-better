@@ -1,373 +1,303 @@
 {
   "tickets": [
     {
-      "id": "T0",
-      "title": "Author D2 characterization rails (fresh context, pre-restructure)",
-      "body": "Motivation: T1-T4 restructure src/identify.js's D2 loop. Pin what must\nnot change *before* anyone changes it (ADLC P3; rails authored fresh-context,\nfrozen). Author in a fresh context from do-better/SKILL.md's D2 section plus\nthe public contracts documented in handoff.md §2 -- NOT by reading\nsrc/identify.js's internals.\n\nScope: test/identify-rails.test.js (new file only).\n\nPin (bug-compatible where noted):\n1. run(ctx) without a passed comprehend gate throws OpError (exit 1).\n2. Gate pass requires all dimensions dry AND zero unverified written; gate\n   fail throws GateError with .gate === \"identify\", .state attached, exit 2.\n3. Verified findings are written via writeFinding with status: \"verified\",\n   evidence [{file, line, sha}], and a reproduction record; killed\n   candidates are never written.\n4. Re-run seeds dedupe from readFindings -- no duplicate finding files or\n   IDs (D6 idempotency).\n5. Offline mode: deterministic static pass per dimension, single pass,\n   declared degradation in the summary string.\n6. Candidate validation drops unsafe paths / bad severities silently (fail\n   closed).\n7. State shape: phases.identify.{passesByDimension, killed, verified} and\n   gates.identify.{passed, dryPassesByDimension, unverified} keys exist\n   (T1 may ADD keys; these must remain).\n\nExplicit non-pins -- do NOT assert these; T1-T4 legitimately change them:\npass-count magnitudes, exact GateError detail wording, or any LLM\nsystem/user prompt content. Assert presence/shape/invariants only (e.g.\n\"passesByDimension[dim] is a positive integer\"), never today's specific\nnumbers or strings. A rail that pins these makes T1 unlandable for a defect\nauthored into the plan, not the code.\n\nAcceptance criteria:\n- AC1: node --test test/identify-rails.test.js green against current main,\n  before any T1 code lands. (Verification: run on main.)\n- AC2: No existing test file modified. (Verification: git diff --stat main\n  -- test/ shows only the new file.)\n- AC3: Rails are non-vacuous. CORRECTION FROM EXECUTION: adlc hollow-test\n  cannot validate this -- it unconditionally excludes test/spec files from\n  mutation targets and is strictly diff-scoped with no explicit-target flag;\n  T0's diff is test-only, so it always reports 0 mutants/exit 0 regardless\n  of rail quality. Use a manual regression-injection spot-check instead:\n  for each pin, temporarily break the corresponding behavior in\n  src/identify.js, confirm the pinned rail goes red, then revert. Spot-check\n  found a real gap in the first draft of pin 1 (an adjacent guard clause\n  produced an indistinguishable OpError under the non-pin rule) -- fixed by\n  isolating the precondition. (Manual mechanical check, documented in the\n  commit message.)\n\nFull context: handoff.md §3 \"T0\", §2 \"Ground rules\", §2b (mechanical gates).",
+      "id": "H1",
+      "title": "Fix cross-phase budget under-enforcement (spentBase stale after drainSpend)",
+      "body": "Motivation: [F-reliability-budget-crossphase] createLLM() captures spentBase ONCE from\nstate.budget.spentUSD (src/llm.js:284) and checkBudget computes spent = spentBase + accumulated.costUSD\n(llm.js:309). bin/cli.js creates ONE llm instance for the whole `do-better run` loop; every phase ends\nwith addSpend(state, PHASE_ID, llm.drainSpend()) and drainSpend() (llm.js:421-428) zeroes `accumulated`\nwhile spentBase never advances. So after scan drains, comprehend's budget checks see none of scan's spend;\nunder --budget 10 with phases each spending $8 every phase passes checkBudget and the process spends $40+.\nThis silently breaks the D10 hard-ceiling / stop-the-world BudgetError doctrine the resume machinery depends on.\n\nDesign (decided): change spentBase from const to let; in drainSpend(), before zeroing, do\n`spentBase += accumulated.costUSD`. checkBudget's running total (spentBase + accumulated.costUSD) is then\npreserved across drains. No public-API change; sequential single-phase callers are unaffected (one drain\nat phase end, spentBase already reflects it on the next phase's first check).\n\nAcceptance criteria:\n- AC1: A single llm instance, two sequential spend-then-drain cycles, then checkBudget reflects the SUM of\n  both drained costs (not just the current accumulator) — verified by: a new unit test in test/llm.test.js\n  driving call() via DOBETTER_FAKE_LLM with a low --budget, asserting BudgetError fires on the cycle whose\n  cumulative-across-drains spend crosses the ceiling (fails on main, passes after fix).\n- AC2: Within a single phase (no drain), budget behavior is byte-identical to today — verified by:\n  existing test/llm.test.js budget tests stay green.\n- AC3: Full suite + T0 rails green — verified by: node --test.",
       "scope": [
-        "test/identify-rails.test.js"
+        "src/llm.js",
+        "test/llm.test.js"
       ],
       "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js"
+        "test/identify-rails.test.js"
       ],
       "edges": [
         {
-          "to": "T1"
-        },
-        {
-          "to": "T8"
+          "to": "H2"
         }
       ],
+      "duration": 1,
+      "category": "reliability"
+    },
+    {
+      "id": "H2",
+      "title": "Reservation-based budget check so concurrent calls cannot overshoot the cap",
+      "body": "Motivation: [F-accelerate-budget-reservation] checkBudget (src/llm.js:306-318) is check-then-record:\nit reads spent before the network call, recordSpend (320-326) lands after. This is already live-exploitable —\nsrc/roadmap.js:546 runs `Promise.all(tickets.map(... repairTicket(ctx,t) ...))` (repairTicket = a real LLM\ncall via withFallback) so N concurrently-gapped tickets each pass the same budget snapshot and collectively\novershoot by up to (N-1)x per-call cost. It becomes categorical the moment H8 (concurrent finder pools /\nD1 readers) ships. Silent overshoot violates the D10 hard-ceiling doctrine.\n\nDesign (decided): inside createLLM's closure add a `reserved` accumulator. checkBudget computes estCost\n(already at 310-311), checks `spentBase + accumulated.costUSD + reserved + estCost > limit`, then adds\nestCost to `reserved`. The call path must RELEASE the reservation in try/finally around the provider/fake\ncall — recordSpend records actuals AND subtracts the reservation; the retry-exhaustion OpError path and the\nfake non-string throw (llm.js:395) must also release (finally handles all). A provable no-op for sequential\ncallers: reserved is always 0 at check time when calls don't overlap.\n\nAcceptance criteria:\n- AC1: Two overlapping call() promises against --budget where each alone fits but both together exceed →\n  the second's checkBudget throws BudgetError (reservation seen) — verified by: a test/llm.test.js test with\n  a fake whose function blocks on a shared gate until both callers have passed checkBudget.\n- AC2: reserved returns to 0 after each call settles (success, provider error, and fake-throw) — verified by:\n  a test asserting a later sequential call sees no phantom reservation after an errored concurrent batch.\n- AC3: Sequential behavior byte-identical to H1 output — verified by: existing budget tests green.\n- AC4: Full suite green.\n\nDependencies: H1 — contract: src/llm.js checkBudget/drainSpend (H1 lands the spentBase-promotion this builds on).",
+      "scope": [
+        "src/llm.js",
+        "test/llm.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [
+        {
+          "to": "H8"
+        }
+      ],
+      "duration": 2,
+      "category": "reliability"
+    },
+    {
+      "id": "H3",
+      "title": "Retry classification + record spend on billed-but-unparseable responses (+ injectable sleep)",
+      "body": "Motivation: [F-reliability-retry-classify][F-reliability-spend-leak] callProvider's retry loop\n(src/llm.js:340-372) retries ALL errors 3x with fixed 1s/2s backoff: a permanent 400/401/403/422 burns ~3s\nof dead sleep + re-issues doomed requests, and 429/529 ignore Retry-After. Worse, when res.ok is true (the\nprovider BILLED tokens) but req.parse(data) throws (llm.js:357 — realistic for Gemini safety-blocked\ncandidates with usageMetadata but no text, or OpenAI refusal shapes), the catch retries with ZERO\nrecordSpend — billed tokens never reach `accumulated`, so checkBudget and the persisted spentUSD undercount,\ncompounding H1/H2's ceiling doctrine.\n\nDesign (decided): (1) attach res.status to the thrown non-ok Error (llm.js:354); add isRetryable(err) —\nretry only network errors, 408, 429, and 5xx; fail fast (throw OpError immediately) on other 4xx and on\nparse errors. (2) In the billed-but-unparseable path, recordSpend the estimated (or data.usage) tokens\nbefore deciding to fail — spend must never escape accounting. (3) Add an injectable `sleepImpl` to createLLM's\ndeps (alongside fetchImpl) so retry/backoff is testable without real wall-clock (unblocks H4).\n\nAcceptance criteria:\n- AC1: A 401/400/422 response fails after exactly ONE request, no retry sleeps — verified by: test/llm.test.js\n  fetchImpl call-count + sleepImpl spy.\n- AC2: A network error / 503 retries up to RETRY_ATTEMPTS then throws the labelled OpError — verified by:\n  fetchImpl-driven exhaustion test with injected sleepImpl (no real delay).\n- AC3: res.ok true + req.parse throws → recordSpend was called (spend recorded, not lost) then the call\n  fails/retries per classification — verified by: assert accumulated/drainSpend reflects the billed tokens.\n- AC4: Full suite green.\n\nDependencies: none functional; H4 depends on this (sleepImpl seam).",
+      "scope": [
+        "src/llm.js",
+        "test/llm.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [
+        {
+          "to": "H4"
+        }
+      ],
+      "duration": 2,
+      "category": "reliability"
+    },
+    {
+      "id": "H4",
+      "title": "Test coverage for callProvider retry/backoff loop",
+      "body": "Motivation: [F-tests-retry-loop] callProvider (src/llm.js:340-372) is the reliability layer for\nevery online call and has zero retry coverage — the only response-returning fetchImpl test\n(test/llm.test.js:131) is a first-try local success. Retry-then-succeed, exhaustion→labelled OpError\n(369-371), the non-ok HTTP branch (352-355), and backoff doubling are all uncovered; a regression ships green.\n\nDesign (decided): using H3's injectable sleepImpl, add ~4 fetchImpl-driven tests. One test must PIN H3's\nspend-recording fix (billed-but-unparseable → spend recorded), so the test survives as a regression guard.\n\nAcceptance criteria:\n- AC1: Retry-then-succeed on attempt 2 returns the text and records spend once — verified by: new test.\n- AC2: Exhaustion throws OpError naming provider/model — verified by: new test.\n- AC3: Backoff delays double (1000→2000) — verified by: sleepImpl spy captures the delay sequence.\n- AC4: Full suite green fast (< a few seconds; no real sleeps).\n\nDependencies: H3 — contract: src/llm.js createLLM deps (sleepImpl seam + status classification).",
+      "scope": [
+        "test/llm.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
       "duration": 1,
       "category": "test"
     },
     {
-      "id": "T1",
-      "title": "Coverage-driven dry loop + packet-starvation fix (D2 identify)",
-      "body": "Motivation: finder passes today see <=30KB (PACKET_BYTES) of a\n~150KB deep-read set, with a break-not-skip bug in buildFinderPacket that can\nmake the gate pass with zero findings on an empty packet, silently. Fix\nconverts the loop from \"rotate a shared window\" to \"partition the whole\ndeep-read set into packets; every (dimension x packet) cell runs\nloop-until-dry independently.\"\n\nScope: src/identify.js, do-better/SKILL.md (D2 section),\ndo-better/references/verification.md (coverage note), README.md,\ntest/identify.test.js (additions), test/identify-coverage.test.js (new).\n\nDesign (decided -- do not relitigate):\n1. Fix buildFinderPacket: replace break with skip-and-continue; a single\n   chunk exceeding PACKET_BYTES is hard-truncated via existing truncate()\n   rather than dropped. Given >=1 readable slice, the packet is never empty.\n2. New pure function partitionSlices(slices, maxBytes = PACKET_BYTES)\n   returns [{files: [names], packet: string}] -- every readable slice in\n   exactly one packet; oversized slices become singleton truncated packets;\n   deterministic input-order.\n3. Loop inversion: for each dimension (descending charter weight), for each\n   packet, loop-until-dry (K_DRY=2 consecutive zero-new passes, cap\n   MAX_PASSES=8 per dimension x packet cell). rotate() is deleted.\n   Prior-conclusions list stays pool-wide per dimension (not per-packet).\n4. Starvation is a gate failure, never silent: empty/unreadable deep-read\n   set online throws GateError (.gate=\"identify\"); offline is exempt.\n5. State additions: phases.identify.packetsByDimension {dimId:count};\n   passesByDimension becomes total passes summed across packets;\n   gates.identify gains packetsByDimension; not-dry detail names dimension\n   AND packet index.\n6. D2 finder coverage manifest: after the loop, idempotently write a\n   \"## D2 finder coverage\" section in\n   .dobetter/comprehension/coverage-manifest.md: per dimension -- files\n   examined, packet count, total passes, truncated-slice list; unreadable\n   deep-read files under a \"### Unexamined\" subheading. Offline: section is\n   still written (never empty) -- files examined from T0 rail 5's static\n   pass; packet count/passes are 0/1 with a \"(offline -- no packetization)\"\n   note.\n7. Cost note in README + SKILL.md: calls scale as\n   dims x packets x passes x poolN; --budget remains the hard ceiling.\n8. Persisted per-cell dry state (in scope, not deferred):\n   phases.identify.dryCellsByDimension {dimId:[packetIndex,...]} records\n   packets that reached K_DRY. Re-run against the SAME headSha skips\n   already-dry packets entirely (zero re-issued finder calls). A SHA change\n   discards all dry-cell state. Makes BudgetError resumable instead of\n   restart-from-zero.\n\nAcceptance criteria (each names its verification method):\n- AC1: partitionSlices covers all slices exactly once; oversized slice ->\n  singleton truncated packet; never returns [] for non-empty input. (Unit\n  test, test/identify-coverage.test.js.)\n- AC2: Regression test reproducing the break-bug -- a slice whose numbered\n  form exceeds PACKET_BYTES at rotation head -- fails on main's builder,\n  passes on the new one; fake-LLM finder receives the OTHER file's content\n  too (assert via fake-LLM prompt log). (Integration test, fake-LLM seam.)\n- AC3: With 2 dimensions x 3 packets in the fake fixture, every packet's\n  content appears in >=1 finder prompt per dimension. (Integration test.)\n- AC4: Empty/unreadable deep-read set online -> GateError exit 2 with\n  descriptive detail; offline unaffected. (Integration test.)\n- AC5: coverage-manifest.md gains the \"## D2 finder coverage\" section;\n  re-running replaces rather than duplicates it. (Integration test.)\n- AC6: T0 rails + full existing suite green. (node --test.)\n- AC7: SKILL.md D2 step 1-2 and README updated to describe packetized\n  coverage. (Reviewer check -- grep for \"packet\" in both.)\n- AC8: BudgetError mid-run, same-SHA re-run: cells already dry are not\n  re-queried (zero fake-LLM calls for those cells); a not-yet-dry cell\n  resumes from its recorded pool. SHA change clears all dry-cell state.\n  (Integration test.)\n- AC9: README gains a \"Sizing --budget\" table with expected D2 call counts\n  for a reference repo shape (8 dims x ~5 packets x K_DRY=2 x\n  charter-weighted N -- see T2). (Reviewer check.)\n\nFull context: handoff.md §3 \"T1\", §5 (partitionSlices contract), §7 (cost\nrisk).",
+      "id": "H5",
+      "title": "Test coverage for anthropic/gemini request builders",
+      "body": "Motivation: [F-tests-request-builders] buildRequest (src/llm.js:205-252) for anthropic and gemini\nis never executed by any test (confirmed via node --test --experimental-test-coverage: lines 205-253\nuncovered). The one provider:\"anthropic\" reference (test/llm.test.js:241) sets DOBETTER_FAKE_LLM so config\nbecomes \"fake\" and buildRequest is bypassed. Anthropic is the FIRST autodetected provider — every real user\nrun goes through untested code; a typo in URL/headers/body ships green.\n\nDesign (decided): createLLM({ flags:{provider:\"anthropic\"}, env:{ANTHROPIC_API_KEY:\"k\"}, fetchImpl }) with a\nrequest-capturing fetchImpl that returns a canned provider-shaped body; assert URL, headers\n(x-api-key/anthropic-version), body (system as top-level field), the parse() output, and jsonMode handling.\nMirror for gemini (systemInstruction, responseMimeType at 237, x-goog-api-key). No src/ change.\n\nAcceptance criteria:\n- AC1: Anthropic request URL/headers/body-shape asserted against a captured request — verified by: new test.\n- AC2: Anthropic parse() returns {text,tokensIn,tokensOut} from a canned response — verified by: new test.\n- AC3: Gemini request URL/headers/body (systemInstruction + responseMimeType when jsonMode) asserted —\n  verified by: new test.\n- AC4: Coverage of src/llm.js buildRequest anthropic+gemini branches goes from 0 to executed — verified by:\n  node --test --experimental-test-coverage no longer lists 205-252 fully uncovered.\n- AC5: Full suite green.",
       "scope": [
-        "src/identify.js",
-        "do-better/SKILL.md",
-        "do-better/references/verification.md",
-        "README.md",
-        "test/identify.test.js",
-        "test/identify-coverage.test.js"
+        "test/llm.test.js"
       ],
       "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
         "test/identify-rails.test.js"
       ],
-      "edges": [
-        {
-          "to": "T2"
-        },
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 3,
-      "category": "refactor"
+      "edges": [],
+      "duration": 1,
+      "category": "test"
     },
     {
-      "id": "T2",
-      "title": "Pooled, lens-diverse D2 finders (fan width)",
-      "body": "Motivation: finder passes today are near-identical (same model,\nsame prompt, slices merely rotated) -- \"dry\" can mean \"the same context\nconverged,\" not \"the codebase is exhausted.\" Fixes by fanning N finders per\npass with distinct lenses (E1 sampling diversity, P5 pooled prosecutors).\n\nScope: src/identify.js, do-better/references/refute-charter.md (lens\nsection), src/utils.js (only if --n flag plumbing needs it -- it already\nparses), do-better/SKILL.md, README.md (flags table),\ntest/identify-pool.test.js (new).\n\nDesign (decided):\n1. Reuse the existing --n flag (D1 parallax width, default 3) as the\n   MAXIMUM D2 pool width. Charter-weighted (in scope, not deferred):\n   effective width = min(--n, charterPoolWidth(weight)) where weight>=4 ->\n   full --n, weight 2-3 -> max(1, floor(--n/2)), weight 1 -> 1 (no pooling,\n   identical to v0.1 for that dimension). Document the table in both flag\n   tables and references/taxonomy.md.\n2. Add a \"## Lenses\" section to references/refute-charter.md with 5 named\n   lenses (one paragraph each): exploit-author, oncall-3am, new-hire-reader,\n   performance-profiler, staff-skeptic. LEAKAGE HAZARD (must fix, found in\n   review): the finder system prompt (refuteSystem, identify.js:425,\n   loadRef(\"refute-charter.md\", FALLBACK_REFUTE)) is loaded WHOLESALE today\n   and passed verbatim to every finder -- left as-is, every finder would see\n   ALL 5 lens descriptions, diluting the diversity this ticket adds. Fix: a\n   new pure parseLenses(refuteDoc) returns {base: string, lenses:\n   [{id,text}]} -- base is everything ABOVE the \"## Lenses\" heading (used as\n   refuteSystem, replacing today's whole-file load); lenses is the parsed\n   catalog. Fallback (section absent/unparseable): base = whole doc\n   (today's behavior preserved), lenses = hardcoded 5-entry const array,\n   degrade loudly via log.warn.\n3. Each pass of a (dimension x packet) cell issues N finder calls (N =\n   charter-weighted width); call i's system prompt is base + \"\\n\\nLens: \" +\n   lenses[(passIndex+i) % lenses.length].text -- finder sees ONLY its\n   assigned lens, never the catalog.\n4. Pool admission: candidates from all N calls validated+deduped together;\n   newCount is the pooled total; dry streak advances only when the POOL\n   yields zero new. passesByDimension still counts passes, not calls.\n5. A single finder-call failure inside a pool: BudgetError rethrows\n   (stop-the-world); any other OpError after the LLM layer's own 3 retries\n   fails the phase (fail closed).\n\nAcceptance criteria:\n- AC1: With --n 3, each pass issues exactly 3 finder calls with 3 distinct\n  lens strings (assert on fake-LLM prompt log). (Integration test.)\n- AC2: Dry streak: pool pass A yields {2 new,0,0} -> not dry; passes B and C\n  all-zero -> dry at K=2. (Integration test, scripted fake.)\n- AC3: Lens parsing: doc-driven lenses used when present; hardcoded fallback\n  + warning when section missing. (Unit test.)\n- AC4: --n 1 reproduces pre-T2 single-finder call counts. (Integration\n  test.)\n- AC5: T0 rails + full suite green; SKILL.md/README flag tables updated.\n- AC6: Charter-weighted width: weight-1 dimension issues exactly 1 finder\n  call per pass regardless of --n; weight-5 issues --n calls; weight-3\n  issues max(1, floor(--n/2)). (Unit + integration test.)\n- AC7: A finder's system prompt contains its assigned lens text and does\n  NOT contain the \"## Lenses\" heading or any other lens's text (assert on\n  fake-LLM system-prompt log -- the leakage regression item 2 exists to\n  prevent). (Integration test.)\n\nFull context: handoff.md §3 \"T2\".",
-      "scope": [
-        "src/identify.js",
-        "do-better/references/refute-charter.md",
-        "src/utils.js",
-        "do-better/SKILL.md",
-        "README.md",
-        "test/identify-pool.test.js"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T3"
-        },
-        {
-          "to": "T6"
-        },
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 2,
-      "category": "feature"
-    },
-    {
-      "id": "T3",
-      "title": "Semantic dedupe for D2 candidates",
-      "body": "Motivation: dedupe key today is sha256(dimension|file|normalized\nclaim) -- verbatim wording. Models rephrase; real duplicates re-enter the\npool (dry streak resets on noise). Adds a cheap-tier semantic equivalence\ncheck layered over the existing hash filter.\n\nScope: src/identify.js, test/identify-dedupe.test.js (new),\ndo-better/SKILL.md (D2 step 2 wording).\n\nDesign (decided):\n1. Layered admission for each validated candidate:\n   a. Hash filter (existing dedupeKey) -- free, unchanged, still exported.\n   b. Semantic filter (hash-survivors only, online only): one cheap-tier\n      jsonCall per candidate comparing against prior admitted entries with\n      the SAME dimension AND SAME file (small list): prompt lists prior\n      {index,title,claim}, asks {\"duplicateOf\": null | <index>}. Duplicate\n      -> not admitted, does not reset the dry streak, and its key is added\n      to seen so the paraphrase is not re-litigated next pass.\n2. Fails OPEN, deliberately: unparseable/erroring semantic check => treat\n   as new. Rationale: a false-new costs one wasted verification; a\n   false-duplicate loses a finding permanently -- verification downstream\n   kills junk, nothing resurrects a wrongly-suppressed finding. This is the\n   ONE sanctioned fail-open in D2 -- document it in a code comment AND\n   SKILL.md.\n3. Offline: hash-only (declared degradation in the summary line).\n4. Prior-findings seeding (D6) also participates: semantic comparison list\n   includes prior verified findings for that dimension+file (from\n   readFindings).\n\nAcceptance criteria:\n- AC1: Paraphrase fixture -- same defect, different wording, same\n  dimension+file -- is suppressed; dry streak advances; no second finding\n  file on re-run. (Integration test, scripted fake returning duplicateOf.)\n- AC2: Genuinely distinct claim in the same file is admitted. (Integration\n  test.)\n- AC3: Semantic-check failure => candidate admitted (fail open) +\n  log.warn. (Integration test.)\n- AC4: Semantic check runs at tier:\"cheap\" and only for same\n  dimension+file pairs. (Integration test.)\n- AC5: T0 rails + full suite green.\n\nFull context: handoff.md §3 \"T3\".",
+      "id": "H6",
+      "title": "Semantic-dedupe judge and finder prior-list carry file:line",
+      "body": "Motivation: [F-pipeline-dedupe-noline] isSemanticDuplicate (src/identify.js:572) builds its prompt\nfrom title+claim only (575-581), and the finder prior-conclusions list (687-690) is title+file only. Two\ngenuinely distinct defects of the same class in one file — e.g. two swallowed catch blocks at lines 120 and\n480 — produce near-identical title/claim text, so the cheap judge (DEDUPE_SYSTEM) has NO signal to separate\n\"paraphrase of the same issue\" from \"same class at a different location\". The code's own doctrine (566-570)\nand SKILL.md declare a false duplicate permanently unrecoverable. priorFixed from readFindings (915-917)\nalready drops evidence[0].line even though it exists (491); every candidate carries a required validated\n`line` (148-170). Pure prompt plumbing of data already in hand.\n\nDesign (decided): (1) priorByDim entries (915-917) include `line: prior.evidence?.[0]?.line ?? null`.\n(2) isSemanticDuplicate's list (575-577) renders `${file}:${line}` per prior entry, and the new-finding\nblock includes the candidate's file:line. (3) finderCell priorList (687-690) renders `${title} (${file}:${line})`.\n(4) Update SKILL.md D2 step 2 wording to note location is part of the duplicate judgment.\n\nAcceptance criteria:\n- AC1: Two candidates, same dimension+file+title/claim wording but different lines → the second is NOT\n  suppressed (admitted as distinct) when the scripted dedupe fake keys off the line in the prompt — verified\n  by: a test in test/identify-dedupe.test.js asserting the dedupe prompt CONTAINS both file:line pairs and\n  the second candidate becomes a finding.\n- AC2: A true paraphrase at the SAME file:line is still suppressed — verified by: existing dedupe paraphrase\n  test stays green.\n- AC3: T0 rails (test/identify-rails.test.js) + full suite green — verified by: node --test.",
       "scope": [
         "src/identify.js",
         "test/identify-dedupe.test.js",
         "do-better/SKILL.md"
       ],
       "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T4"
-        },
-        {
-          "to": "T6"
-        },
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 2,
-      "category": "feature"
-    },
-    {
-      "id": "T4",
-      "title": "Multi-citation claims + bounded NEED_CONTEXT verification",
-      "body": "Motivation: today's blind verifier is a single frontier vote over\none cited file +/-40 lines -- cross-file claims (architecture,\nmaintainability, operability) cannot be supported by one slice and are\ncorrectly killed, systematically biasing surviving findings toward local\ntrivia. Fixes by letting findings cite multiple files and letting the\nverifier request one bounded round of extra context, without breaking\nverifier blindness (the finder's own reasoning is still withheld).\n\nScope: src/identify.js (finder prompt JSON shape, verifyCandidate,\ncodeSlice usage), src/artifacts.js (ADDITIVE ONLY: finding evidence may\ncarry >1 citation -- first confirm writeFinding/readFindings already\nround-trip an evidence array; T0 rail 3 already pins evidence as an array,\nso this is very likely a no-op edit), do-better/references/verification.md,\ndo-better/references/templates/finding-template.md, do-better/SKILL.md,\ntest/identify-crossfile.test.js (new).\n\nDesign (decided):\n1. Candidate schema (additive): finders may return citations:\n   [{file,line},...] (<=4). file/line remain required, treated as\n   citations[0] when citations is absent. Validation: every citation passes\n   isSafeRelPath + integer line>=1, else the WHOLE candidate is dropped\n   (fail closed).\n2. Deterministic stage: verifyCitations must verify ALL citations; any\n   failure kills the candidate.\n3. Repro stage: unchanged.\n4. Blind reread stage: verdict prompt includes one +/-40-line slice per\n   citation (cap 4 slices; total slice budget 24,000 chars via truncate).\n   Verifier remains blind to proposer reasoning.\n5. NEED_CONTEXT round (exactly one): VERDICT_SYSTEM gains a fourth verdict\n   NEED_CONTEXT with {\"files\":[\"rel/path\",...]} (<=2). If returned, re-issue\n   the verdict call ONCE with those files' slices appended (each\n   isSafeRelPath-checked, truncated to 8,000 chars; unsafe/unreadable\n   requests are simply omitted). Second response must be\n   CONFIRM/KILL/UNCERTAIN; a SECOND NEED_CONTEXT => killed (fail closed).\n   Reproduction record notes context-round:1 and which files were supplied.\n6. Finding output: evidence array carries all verified citations;\n   finding-template.md documents multi-citation evidence.\n\nAcceptance criteria:\n- AC1: Cross-file fixture: candidate citing 2 files, verdict CONFIRM =>\n  finding written with 2 evidence entries, both SHA-pinned. (Integration\n  test.)\n- AC2: One bad citation among several => killed before any LLM verdict\n  call (zero verdict entries in fake-LLM log). (Integration test.)\n- AC3: NEED_CONTEXT round: first verdict NEED_CONTEXT with a safe path =>\n  exactly one follow-up verdict call whose prompt contains the requested\n  file's content; CONFIRM => verified with context-round in the\n  reproduction record. (Integration test.)\n- AC4: Second consecutive NEED_CONTEXT => killed; unsafe requested path =>\n  omitted from the follow-up, not fetched. (Integration tests.)\n- AC5: Single-citation candidates take NO NEED_CONTEXT round against the\n  scripted fixtures (a real model may legitimately request context even\n  for one citation -- that is the feature working, not a regression); the\n  CONFIRM/KILL/UNCERTAIN verdict CALL COUNT per candidate is unchanged from\n  v0.1 (one call, or two only on an actual NEED_CONTEXT round). Note:\n  VERDICT_SYSTEM itself changes for every candidate (design item 5) -- this\n  AC does NOT claim byte-identical prompts, only unchanged call-count\n  behavior on fixtures that don't trigger NEED_CONTEXT. T0 rails and\n  pre-T4 verdict-path tests stay green. (Rails + full suite + new\n  scripted-fake call-count assertion.)\n- AC6: verification.md + finding-template.md + SKILL.md updated.\n\nFull context: handoff.md §3 \"T4\", §5 (Verdict JSON contract).",
-      "scope": [
-        "src/identify.js",
-        "src/artifacts.js",
-        "do-better/references/verification.md",
-        "do-better/references/templates/finding-template.md",
-        "do-better/SKILL.md",
-        "test/identify-crossfile.test.js"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T7"
-        },
-        {
-          "to": "T8"
-        },
-        {
-          "to": "T6"
-        }
-      ],
-      "duration": 3,
-      "category": "feature"
-    },
-    {
-      "id": "T5",
-      "title": "Distill: verified findings -> suggested permanent controls",
-      "body": "Motivation: verified findings never convert into permanent cheap\ncontrols today -- every engagement re-buys the same detections (ADLC P7 /\nlesson-foundry doctrine). Adds a standalone \"distill\" phase that clusters\nfindings and proposes the cheapest permanent defense per cluster.\n\nScope: src/distill.js (new, self-contained: exports run(ctx) + PHASE_ID),\nsrc/artifacts.js (LAYOUT addition), do-better/SKILL.md (new section),\nREADME.md, test/distill.test.js (new). Does NOT touch src/utils.js,\nbin/cli.js, or src/refresh.js -- CLI registration and the refresh\nauto-invoke wiring are ticket T5b, not this one (two review findings\nestablished that utils.js and refresh.js are single-writer-owned by\nworktree 1, where T6/T7 also edit them; claiming them \"disjoint\" from\nworktree 1 was false both times and guaranteed a merge conflict).\n\nDesign (decided):\n1. New command \"npx do-better distill\" (invocable standalone -- the\n   auto-invoke-at-end-of-refresh wiring is T5b's job; src/distill.js\n   exports run(ctx) for T5b to call, but this ticket does not itself touch\n   refresh.js). Requires >=1 verified finding; otherwise a clean no-op with\n   a message (exit 0).\n2. Clustering: group verified findings (current + all prior runs -- they\n   persist in findings/) by dimension, then one cheap-tier jsonCall per\n   dimension proposing clusters: {\"clusters\":[{\"label\":\"...\",\n   \"findingIds\":[\"F-...\"], \"rationale\":\"...\"}]}. Offline fallback: cluster\n   by identical static check.type only (declared).\n3. Control proposal: for each cluster with >=2 findings, one mid-tier call\n   proposing the cheapest permanent defense, constrained to three shapes:\n   {\"type\":\"grep\",\"pattern\":\"...\",\"file\":\"...\"} or\n   {\"type\":\"grep-repo\",\"pattern\":\"...\"} (static check runnable by\n   runReproCheck / added to staticFinderPass heuristics);\n   {\"type\":\"lint\",\"tool\":\"eslint|other\",\"sketch\":\"...\"} (human-readable rule\n   sketch); {\"type\":\"skill\",\"suggestion\":\"...\"} (routed to skill-mining when\n   present, reuse src/adlc.js locate/degrade table -- read ctx.adlc.available,\n   do not re-locate ad hoc).\n4. Verification of controls: grep-shaped controls are executed against the\n   current worktree via runReproCheck; a control that doesn't currently\n   fire is still emitted but marked dormant:true (defends the future).\n   Lint/skill shapes marked unverified-suggestion.\n5. Artifacts: .dobetter/distilled/lessons.md (human) and\n   .dobetter/distilled/controls.json (machine: {version:1, generatedAt,\n   headSha, controls:[{id:\"C-NNN\", cluster, findingIds, control,\n   status:\"verified\"|\"dormant\"|\"unverified-suggestion\"}]}). Idempotent:\n   re-runs regenerate both from the full findings set; C-NNN ids\n   stable-keyed by cluster-label hash.\n6. State: phases.distill recorded via recordPhase/addSpend (add \"distill\"\n   to PHASES in src/state.js -- confirm additive-safety with the state\n   round-trip tests). No gate, no human approval.\n\nAcceptance criteria:\n- AC1: Fixture with 3 verified findings (2 same-class) => one cluster of 2,\n  one control emitted; controls.json validates against the shape above.\n  (Integration test, scripted fake.)\n- AC2: Grep-shaped control that fires => status:\"verified\" with a repro\n  record; non-firing => \"dormant\". (Integration test.)\n- AC3: Zero findings => exit 0, friendly message, no artifacts. (CLI test.)\n- AC4: Re-run is idempotent -- stable C-NNN ids, no duplicate sections.\n  (Integration test.)\n- AC5: Full suite green; README/SKILL.md document the command's behavior\n  and artifacts. (CLI registration, the refresh auto-invoke wiring, and\n  their tests are T5b's ACs, not this ticket's.)\n\nFull context: handoff.md §3 \"T5\".",
-      "scope": [
-        "src/distill.js",
-        "src/artifacts.js",
-        "do-better/SKILL.md",
-        "README.md",
-        "test/distill.test.js"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T5b"
-        },
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 3,
-      "category": "feature"
-    },
-    {
-      "id": "T5b",
-      "title": "Wire distill into the CLI surface and into refresh",
-      "body": "Motivation: two review findings, same failure class, twice: T5's\noriginal scope claimed src/utils.js (round 1) and separately src/refresh.js\n(round 2) as disjoint from worktree 1 for parallel execution, while T6/T7\nalso edit both there -- a guaranteed conflict in HELP_TEXT (round 1) and in\nrefresh.js's eval-repro re-verification logic (round 2, T7 also edits\nrefresh.js). Single-writer rule resolves both: utils.js/bin/cli.js/\nrefresh.js are worktree-1-owned; this ticket does all three integrations\nthere, after BOTH T5's src/distill.js and T7's refresh.js changes have\nmerged to main -- so this is also where the two independent refresh.js\nchanges (T7's eval-repro gating, this ticket's distill auto-invoke) get a\nsingle integration test proving they compose correctly.\n\nScope: src/utils.js (COMMANDS set + HELP_TEXT), bin/cli.js (new \"distill\"\ndispatch case calling distill.run), src/refresh.js (import distill.run,\ninvoke non-fatally at the end of a refresh run -- warn on throw, never fail\nrefresh's own exit code), test/cli.test.js and test/refresh.test.js\n(additions).\n\nDesign (decided):\n1. Add \"distill\" to COMMANDS in src/utils.js.\n2. Add a distill section to HELP_TEXT.\n3. Add the dispatch case in bin/cli.js, mirroring the existing per-phase\n   command wiring (same shape as scan/charter/etc.).\n4. In refresh.js, import distill.run and call it non-fatally at the end of\n   a refresh run: a thrown error is caught, warned via log.warn, and does\n   not change refresh's own exit code or gate outcome.\n\nAcceptance criteria:\n- AC1: \"npx do-better --help\" lists distill with its one-line description.\n  (Spawn test, cli.test.js-style.)\n- AC2: \"npx do-better distill\" dispatches to src/distill.js's run(ctx).\n  (Integration test.)\n- AC3: refresh still exits per its own contract when distill.run throws\n  (warn-only, exit code unaffected). (Integration test with a fake that\n  errors on distill labels.)\n- AC4: COMPOSITION TEST (the reason this ticket waits for both T5 and T7):\n  a single refresh run with --eval-repro unset correctly (a) skips\n  re-executing eval-shaped stored repros -- flagging them\n  stale-unverifiable per T7 -- AND (b) still auto-invokes distill.run at\n  the end of the same run. Both behaviors asserted in ONE integration test,\n  proving the two independently-developed refresh.js changes don't\n  silently break each other on merge. (Integration test.)\n- AC5: Full suite green; T0 rails untouched.\n\nFull context: handoff.md §3 \"T5b\", §4 (single-writer sequencing rationale).",
-      "scope": [
-        "src/utils.js",
-        "bin/cli.js",
-        "src/refresh.js",
-        "test/cli.test.js",
-        "test/refresh.test.js"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 1,
-      "category": "chore"
-    },
-    {
-      "id": "T6",
-      "title": "Bounded concurrency for D2 finder pools and verification",
-      "body": "Motivation: all finder/verify LLM calls are strictly sequential\nawaits today -- wall-clock cost only, not correctness. Adds a small\nzero-dep concurrency helper and applies it to the pool/verify paths T2/T3\nadd.\n\nScope: src/utils.js (mapLimit), src/identify.js (apply), test/utils.test.js\n(additions), test/identify.test.js (determinism assertion).\n\nDesign (decided):\n1. export async function mapLimit(items, limit, fn) in src/utils.js --\n   zero-dep, order-preserving results, first rejection propagates after\n   in-flight tasks settle.\n2. Apply to: (a) the N pooled finder calls within a pass (limit=N, <=4);\n   (b) per-candidate verification within a dimension (limit 4). Dimensions\n   and packets remain sequential (keeps spend ordering and logs readable).\n3. Budget note (document, don't fix): checkBudget is check-then-record;\n   under concurrency the ceiling can overshoot by at most (limit-1) x\n   maxCallCost. Acceptable and documented in a code comment + README budget\n   row. Spend accumulation itself is single-threaded-safe (no await between\n   read and write in recordSpend).\n4. Determinism: pool admission order = lens index order (stable), regardless\n   of completion order -- sort results before admission.\n\nAcceptance criteria:\n- AC1: mapLimit unit tests: order preserved, limit respected (concurrent\n  counter probe), rejection propagates. (Unit tests.)\n- AC2: Identify results (finding ids, files, state) byte-identical between\n  limit=1 and limit=4 runs on the same scripted fake. (Integration test.)\n- AC3: Full suite green.\n\nNote: this ticket functionally depends only on T2+T3 (the pool/verify paths\nit applies concurrency to) -- it has NO functional dependency on T4's\nchanges, even though it is sequenced after T4 in the single-writer worktree\norder documented in handoff.md §4. That worktree-ordering constraint is\noperational (avoiding concurrent-worktree conflicts on src/identify.js), not\na DAG dependency -- stated explicitly here so a coldstart agent does not\ninfer a missing functional dependency on T4.\n\nFull context: handoff.md §3 \"T6\", §4 (sequencing rationale).",
-      "scope": [
-        "src/utils.js",
-        "src/identify.js",
-        "test/utils.test.js",
-        "test/identify.test.js"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T7"
-        },
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 1,
-      "category": "perf"
-    },
-    {
-      "id": "T7",
-      "title": "Eval-repro opt-in (--eval-repro flag, safe default)",
-      "body": "Motivation: sanitizeRepro today permits model-proposed \"node -e\"\nsnippets (<=500 chars) executed with full user privileges against the\ntarget repo -- a hostile brownfield repo is a prompt-injection surface into\nthe mid-tier model proposing the snippet. The plan's own review called this\n\"unacceptable posture for enterprise engagements.\" DECISION (supersedes an\nearlier opt-out design considered during planning): the default flips to\nsafe -- eval-repro is OFF by default, opt-in via a flag, not opt-out.\n\nScope: src/utils.js (parseArgs + HELP_TEXT), src/identify.js (sanitizeRepro\ngains an options arg), src/refresh.js (re-verification must honor it for\nstored eval-shaped repros), do-better/SKILL.md + README.md flag tables,\nSPEC.md addendum note (T8's job) recording the default-flip as a locked\ndecision, test/identify.test.js additions.\n\nDesign (decided):\n1. New boolean flag --eval-repro (default false -- the new safe default).\n   Unset (default): sanitizeRepro unconditionally rejects the \"node -e\"\n   shape (falls through to blind reread -- existing path; functional cost\n   is one extra frontier verdict call per candidate that would previously\n   have used eval repro). \"node --test\" and grep shapes remain allowed\n   unconditionally -- they execute repo-authored code or no code at all, a\n   different trust class than model-proposed \"node -e\". Set: v0.1 behavior\n   (eval proposals sanitized and run).\n2. Refresh: stored reproduction records of method:\"command\" whose cmd is\n   eval-shaped are re-executed ONLY when --eval-repro is passed to refresh;\n   otherwise the finding is flagged stale-unverifiable with a declared\n   reason. This is the INVERSE of v0.1's default -- call it out explicitly\n   in the T8 SPEC addendum as a behavior change, not just a new flag.\n3. Record the flag in state.json run history (beginRun already records\n   command/provider; add a flags snapshot if trivially additive, else skip\n   -- the declared-degradation note in gate records is the requirement).\n\nAcceptance criteria:\n- AC1: Without the flag (default), a proposed \"node -e\" repro is never\n  spawned (assert via exec-spy) and the candidate proceeds to blind\n  reread. (Integration test.)\n- AC2: With --eval-repro, behavior matches v0.1. Note: T0 rails stay green\n  under this AC ONLY because T0's non-pin rule forbids pinning exact\n  pass/verified counts -- those numbers can legitimately differ once eval\n  repro is opted back in. (Integration test.)\n- AC3: Refresh without the flag flags eval-repro findings as unverifiable\n  with a reason, exit code unchanged; with the flag, re-executes them as\n  v0.1 did. (Integration test, both branches.)\n- AC4: Help/README/SKILL.md updated; README states the default explicitly\n  and cites the security rationale. (Spawn test asserts the flag and its\n  default appear in help output.)\n\nFull context: handoff.md §3 \"T7\".",
-      "scope": [
-        "src/utils.js",
-        "src/identify.js",
-        "src/refresh.js",
-        "do-better/SKILL.md",
-        "README.md",
-        "SPEC.md",
-        "test/identify.test.js"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
-        "test/identify-rails.test.js"
-      ],
-      "edges": [
-        {
-          "to": "T5b"
-        },
-        {
-          "to": "T8"
-        }
-      ],
-      "duration": 1,
-      "category": "security"
-    },
-    {
-      "id": "T8",
-      "title": "Docs, spec addendum, version bump, and prosecution (v0.2.0 close-out)",
-      "body": "Motivation: close the loop; keep SPEC.md as law. This is the\nfinal ticket -- every other ticket must have merged to main before this one\nruns, and it carries the release-facing documentation and the pre-merge\nadversarial-review prosecution gate for the whole v0.2.0 diff.\n\nScope: SPEC.md (addendum section \"v0.2.0 -- D2 hardening\", recording the\nnew locked decisions: packetized coverage, persisted per-cell dry state,\ncharter-weighted pool width via --n, semantic dedupe fail-open rationale,\nNEED_CONTEXT bound, distill phase, eval-repro flipped to safe-by-default --\ncall this last one out explicitly as a behavior change from v0.1, not just\na new flag), README.md final pass (including the \"Sizing --budget\" table\nfrom T1 AC9), package.json version -> 0.2.0, CHANGELOG section in README or\nnew CHANGELOG.md.\n\nAcceptance criteria:\n- AC1: SPEC addendum documents every behavior change shipped, in the\n  existing D#-style locked-decision format.\n- AC2: node --test fully green; npm pack --dry-run includes no new\n  unintended files.\n- AC3: PROSECUTION PASS: adversarial review of the full diff (npx\n  adversarial-review --base main, exit 0) -- run loop-until-dry per the\n  house rule; all CRITICAL/HIGH findings resolved. Pass evidence recorded\n  via adlc prosecute (two consecutive dry passes required); ledger sealed\n  with adlc gate-manifest verify.\n- AC4: DISTILL THE BUILD ITSELF: run lesson-foundry over this build's own\n  verified review findings and skill-rot over do-better/references/*\n  (stamps last-verified after the T1-T4 doc changes). Output committed or\n  explicitly declared empty.\n\nFull context: handoff.md entire document is this ticket's scope of review;\n§2b for the mechanical gate discipline (pre-merge check vs post-merge\nrecord split), §6 for the full verification protocol, §7 for known risks\nto re-check before close-out.",
-      "scope": [
-        "SPEC.md",
-        "README.md",
-        "package.json",
-        "CHANGELOG.md"
-      ],
-      "rails": [
-        "test/adlc.test.js",
-        "test/artifacts.test.js",
-        "test/charter.test.js",
-        "test/cli.test.js",
-        "test/comprehend.test.js",
-        "test/identify.test.js",
-        "test/llm.test.js",
-        "test/rail.test.js",
-        "test/refresh.test.js",
-        "test/roadmap.test.js",
-        "test/scan.test.js",
-        "test/state.test.js",
-        "test/utils.test.js",
         "test/identify-rails.test.js"
       ],
       "edges": [],
       "duration": 1,
-      "category": "chore"
+      "category": "pipeline-quality"
+    },
+    {
+      "id": "H7",
+      "title": "Declare deep-read truncation past SLICE_CHARS in the D2 coverage manifest",
+      "body": "Motivation: [F-pipeline-silent-truncation] loadSlices (src/identify.js:258-267) hard-truncates each\nfile to SLICE_CHARS=24,000 at read time; both consumers (renderSlice/LLM packets and the offline regex\nfinders at 351) read the truncated s.raw, so content past 24k is never examined by ANY (dimension × packet)\ncell and partitionSlices' \"every slice in exactly one packet\" guarantee covers only file heads. The\ntruncation is usually UNDECLARED: truncatedFiles (line 781) tests renderSlice(s).length > PACKET_BYTES\n(30,000) against a raw already capped at 24,000, so it only fires when line-number overhead exceeds 6KB.\nEmpirically, identify.js itself (53,675 chars) truncates to lines 1-498, renders at 26,408 < 30,000, and\nthe manifest declares \"Truncated slices: (none)\" while >50% of the file was never audited — a direct breach\nof the declared-never-silent doctrine (D10).\n\nDesign (decided): loadSlices records `truncated: raw.length > SLICE_CHARS` (and optionally fullChars) on\neach slice before truncating. truncatedFiles (781) becomes\n`slices.filter((s) => s.truncated || renderSlice(s).length > PACKET_BYTES)` so BOTH read-time and\npacket-render truncation are declared. The \"## D2 finder coverage\" manifest section already lists truncated\nslices; this ticket makes that list correct. (Splitting oversized files into multiple examined slices is a\nfollow-on, F-pipeline-truncation-split / medium — this ticket DECLARES honestly; it does not yet increase\ncoverage. Note that in verification.md.)\n\nAcceptance criteria:\n- AC1: A deep-read file whose content exceeds SLICE_CHARS appears in truncatedFiles / the manifest's\n  truncated list — verified by: a test in test/identify-coverage.test.js with a >24k fixture file asserting\n  it is declared truncated (fails on main, passes after fix).\n- AC2: A small file rendered under PACKET_BYTES is NOT declared truncated — verified by: same test, negative case.\n- AC3: verification.md notes read-time truncation is declared but not yet split-covered — verified by:\n  reviewer grep for \"truncat\" in verification.md.\n- AC4: T0 rails + full suite green.",
+      "scope": [
+        "src/identify.js",
+        "test/identify-coverage.test.js",
+        "do-better/references/verification.md"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 2,
+      "category": "pipeline-quality"
+    },
+    {
+      "id": "H8",
+      "title": "Concurrent pooled finder calls (D2) and independent reader/behavior calls (D1)",
+      "body": "Motivation: [F-accelerate-finder-pool-seq][F-accelerate-d1-serial] Supersedes v0.2 ticket T6. In\nfinderCell (src/identify.js:674-745) the per-pass prompt/priorList are built ONCE before the pool loop\n(687-696) and the poolWidth jsonCall calls (705) differ only by lens — fully independent, yet awaited one at\na time; per-response validation/dedupe does not feed back into the SAME pass. In comprehend.js the per-packet\nbehavior-inventory calls (396-413) and the five reader artifacts (427-443) are independent (rails-map's only\ninput, behaviors, is complete before any reader runs), yet serial. Parallelizing cuts D2 wall-clock ~poolWidth×\nfor high-weight dimensions and D1 ~3-5×, at ZERO cost and ZERO semantic change.\n\nDesign (decided): add zero-dep order-preserving `mapLimit(items, limit, fn)` to src/utils.js (first\nrejection propagates after in-flight settle). Apply to (a) the poolWidth finder calls WITHIN a pass —\nprocess responses in lens-index order so seen/pool/semantic-dedupe admission order is byte-identical to\nsequential; (b) D1's per-packet behavior calls and the independent readers. Dimensions and packets stay\nSEQUENTIAL (spend ordering, log readability, and the pass-level dry-loop doctrine — prior pool conclusions\nfeed the NEXT pass). DO NOT parallelize per-candidate verifyCandidate: ctx.exec is spawnSync (utils.js:292)\nwhich blocks the event loop, so concurrent verify would serialize on git/repro subprocesses anyway and stall\nsibling fetches — out of scope until the exec layer is async (separate ticket). Requires H2's reservation so\nthe budget ceiling holds under concurrency.\n\nAcceptance criteria:\n- AC1: mapLimit unit tests — order preserved, concurrency ≤ limit (counter probe), first rejection\n  propagates — verified by: test/utils.test.js.\n- AC2: Identify findings/state byte-identical between a forced limit=1 and the concurrent path on the same\n  scripted fake — verified by: test/identify.test.js determinism assertion.\n- AC3: D1 behaviors + reader artifacts byte-identical between serial and concurrent on the same fake —\n  verified by: test/comprehend.test.js.\n- AC4: Budget ceiling still holds under concurrent finder calls — verified by: a --budget test that would\n  overshoot without H2's reservation.\n- AC5: T0 rails + full suite green.\n\nDependencies: H2 — contract: src/llm.js reservation-based checkBudget.",
+      "scope": [
+        "src/utils.js",
+        "src/identify.js",
+        "src/comprehend.js",
+        "test/utils.test.js",
+        "test/identify.test.js",
+        "test/comprehend.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 3,
+      "category": "perf"
+    },
+    {
+      "id": "H9",
+      "title": "Close the vacuous-repro verification hole (relatedness / blind-reread requirement)",
+      "body": "Motivation: [F-pipeline-vacuous-repro] verifyCandidate (src/identify.js:486) treats ANY whitelisted\nrepro that exits 0 as proof: runRepro returns exitCode 0 → verified with method \"command\", skipping the F2\nblind reread entirely. Nothing checks the proposed check relates to the claim. The mid-tier repro proposer\n(REPRO_SYSTEM, line 30) can return `node -e \"1\"` (any non-empty snippet ≤500 chars passes sanitizeRepro\n448-455 and exits 0) or `{\"grep\":{\"pattern\":\".\",\"file\":<cited file>}}` (matches every non-empty file), and\nthe finding is verified without the frontier verifier ever running — the weakest model in the chain defeats\nthe F2 defense. verification.md:49-51 requires \"the command demonstrating the claim succeeds\"; the code\nenforces only \"a command succeeds\".\n\nDesign (decided): coordinate with H-eval (T7 successor) — with eval-repro OFF by default a bare `node -e`\nnever runs. Beyond that: (1) reject catch-all grep patterns (`.`, `.*`, empty) in sanitizeRepro/staticCheckSpec\nas non-demonstrative; (2) require that even a passing command repro is CONFIRMED by the blind frontier reread\n(or that the repro output is asserted to reference the cited symbol/line), so a trivially-passing check cannot\nalone flip a candidate to verified. Keep verifier blindness (proposer reasoning withheld).\n\nAcceptance criteria:\n- AC1: A candidate whose repro is `node -e \"1\"` (eval off) or a catch-all grep does NOT verify on the repro\n  alone — verified by: test/identify.test.js scripted fake asserting the candidate falls through to blind\n  reread (or is killed), not method:\"command\" verified.\n- AC2: A genuine demonstrative repro (grep for the actual cited pattern that matches) still verifies —\n  verified by: existing repro-path test stays green.\n- AC3: verification.md documents the relatedness requirement — verified by: reviewer grep.\n- AC4: T0 rails + full suite green.",
+      "scope": [
+        "src/identify.js",
+        "do-better/references/verification.md",
+        "test/identify.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 2,
+      "category": "pipeline-quality"
+    },
+    {
+      "id": "H10",
+      "title": "Detect a dirty working tree before minting @sha citations (D-1/D1/D2)",
+      "body": "Motivation: [F-reliability-dirty-tree] Only rail.js checks git status --porcelain (rail.js:80-81),\nand only as a warn at D4. scan, comprehend, and identify all read the WORKING TREE (loadSlices, enrichFacts,\nverifyCitations use fs on checkout files) but stamp every citation/evidence record with @headSha from\ngit rev-parse HEAD (identify.js:761, writeFinding evidence pinned to head7). On a dirty tree every\nfile:line@sha claim is attributed to a commit that does not contain that content, refresh's changedFilesSince\ncan't see those edits once committed under the same lines, and reproduction replays against content the sha\nnever had. Violates SPEC.md:82/91 \"all claims pinned to commit SHA\" and the declared-never-silent doctrine.\nThe project already logged this as a round-4 finding (identify.js:269-283) but only defends its resume cache.\n\nDesign (decided): add a shared `workingTreeStatus(root, exec)` helper to src/utils.js; at the START of\nscan/comprehend/identify emit a DECLARED warning (and record it in the coverage manifest / gate record) when\nthe tree is dirty — \"citations pinned to <sha> but the working tree has uncommitted changes; claims may not\nmatch the committed blob.\" Warn-level (not a hard gate) to preserve the personal-use degrade path, but never\nsilent. Optionally add a strict `--require-clean` flag that promotes it to exit-2.\n\nAcceptance criteria:\n- AC1: On a dirty tree, scan emits the declared dirty-tree warning and records it — verified by:\n  test/scan.test.js with an uncommitted file asserting the warning + manifest note.\n- AC2: On a clean tree, no warning — verified by: same test, clean case.\n- AC3: Behavior otherwise unchanged (citations still minted) — verified by: existing scan tests green.\n- AC4: Full suite green.",
+      "scope": [
+        "src/utils.js",
+        "src/scan.js",
+        "src/comprehend.js",
+        "src/identify.js",
+        "test/scan.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 2,
+      "category": "reliability"
+    },
+    {
+      "id": "H11",
+      "title": "scan.js must not lose paid LLM spend when writeArtifact/recordPhase throws",
+      "body": "Motivation: [F-reliability-scan-spend-loss] scan's run() wraps only the LLM call in try/catch\n(src/scan.js:278-293); the drain into state happens later at line 300. If writeArtifact (295) or recordPhase\nthrows AFTER a successful PAID codemap call (disk full, permissions, bad LAYOUT path), the error propagates\nwith no err.state attached, cli.js's catch saves the pre-call state, and the codemap call's cost vanishes\nfrom budget.spentUSD forever — compounding H1's undercount. Every other phase already uses a whole-body catch\nthat attaches err.state = addSpend(state, PHASE_ID, llm.drainSpend()) (charter.js:653-655, identify.js:1046-1050,\ncomprehend.js:527-531).\n\nDesign (decided): extend scan's try to cover writeArtifact + addSpend + recordPhase + pinSha (the whole body\nafter collecting facts), and in the catch attach err.state = addSpend(state, PHASE_ID, llm.drainSpend()) if\nnot already set — mirroring the other phases. Keep the fail-closed semantics (still throws).\n\nAcceptance criteria:\n- AC1: writeArtifact throwing after a paid codemap call → the thrown error carries err.state whose\n  budget.spentUSD includes the codemap spend — verified by: test/scan.test.js injecting a write failure\n  (e.g. read-only dotdir / a stubbed writer) and asserting err.state spend (fails on main, passes after fix).\n- AC2: Happy path unchanged — verified by: existing scan tests green.\n- AC3: Full suite green.",
+      "scope": [
+        "src/scan.js",
+        "test/scan.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 1,
+      "category": "reliability"
+    },
+    {
+      "id": "H12",
+      "title": "refresh: correct asOf sha for stale markers + unify citation regex with artifacts.js",
+      "body": "Motivation: [F-reliability-refresh-asof] Two silent-degradation bugs. (Bug A, primary)\nreverifyFindings (src/refresh.js:129) stamps stale-finding markers with asOfSha = pins.refresh ?? headSha,\nbut the changed-file diff base is pins.comprehend ?? pins.scan (refresh.js:190), and the correct sibling\nflagStaleArtifacts already uses `pinned` (refresh.js:70). On first refresh the marker claims \"changed since\n<current HEAD>\" (vacuously false); on later refreshes it cites the last refresh sha, also wrong since the\ndiff base never advances. (Bug B, secondary) artifacts.js CITATION_RE accepts uppercase hex\n[0-9a-fA-F]{7,40} (artifacts.js:242) but repinText (refresh.js:59), reverifyInventory (107-108) and the\nevidence re-pin (157) use lowercase-only [0-9a-f]{7,40}; an uppercase-SHA citation is silently skipped by\nre-pin, staying pinned to a stale sha with no warning.\n\nDesign (decided): (A) thread `pinned` (the diff base already computed in run(), refresh.js:190) into\nreverifyFindings and use it for asOfSha instead of pins.refresh. (B) export a single CITATION_RE (and a\nsmall parse helper) from src/artifacts.js and use it in all four refresh.js sites so SHA-case handling is\nuniform.\n\nAcceptance criteria:\n- AC1: On first refresh, a stale finding's \">\" marker cites the diff-base sha (pins.comprehend/scan), not\n  current HEAD — verified by: test/refresh.test.js asserting the annotated body's asOf sha equals the diff\n  base (fails on main for Bug A, passes after fix).\n- AC2: An uppercase-SHA citation is re-pinned, not skipped — verified by: a refresh test with an uppercase\n  @SHA citation asserting it advances.\n- AC3: Full suite green.",
+      "scope": [
+        "src/refresh.js",
+        "src/artifacts.js",
+        "test/refresh.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 1,
+      "category": "reliability"
+    },
+    {
+      "id": "H13",
+      "title": "Test coverage for refresh.js reread re-verdict path (RESOLVED stamping)",
+      "body": "Motivation: [F-tests-refresh-reread] reverifyFindings' method===\"reread\" branch (src/refresh.js:131-145)\nasks the frontier LLM for CONFIRM/KILL/UNCERTAIN and on KILL permanently stamps the finding \"> RESOLVED\"\n(151-154) — nothing downstream resurrects a resolved finding, so a regression here silently drops live\nfindings from the roadmap. Confirmed via coverage: refresh.js lines 48-53 (coerceJson) and 132-145 (the\nreread branch) are entirely uncovered. reread findings are produced in production by identify.js:541 (blind\nfrontier reread), so this is a live path, not dead code.\n\nDesign (decided): add scripted-\"verdict\" fake tests: (1) CONFIRM re-pins evidence to the new sha via\nrepinText and clears stale; (2) KILL writes the \"> RESOLVED @ <sha>\" stamp + stale:true and adds the id to\nresolvedIds; (3) UNCERTAIN leaves the finding stale with no resolve; (4) a verdict arriving fenced in\n```json exercises coerceJson (48-53). No src/ change.\n\nAcceptance criteria:\n- AC1: KILL → finding body contains \"> RESOLVED\", meta.stale true, id in resolvedIds — verified by: new test.\n- AC2: CONFIRM → evidence re-pinned to the new sha, stale false — verified by: new test.\n- AC3: UNCERTAIN → stays stale, not resolved — verified by: new test.\n- AC4: Fenced JSON verdict is parsed (coerceJson covered) — verified by: new test.\n- AC5: Full suite green.",
+      "scope": [
+        "test/refresh.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 1,
+      "category": "test"
+    },
+    {
+      "id": "H14",
+      "title": "Test coverage for coldstart gate degradations and ticket-demotion fail-closed paths",
+      "body": "Motivation: [F-tests-coldstart-gaps] Three coldstart-adjacent gate branches in src/roadmap.js are\nuncovered: (1) the offline static-lint degradation (458-464) — coldstart absent AND llm.offline routes gaps\nthrough validateTicket with degraded:\"static-lint\"; no run() test sets llm.offline=true. (2) a FAILING\nnative probe — no test scripts coldstart-probe returning pass:false, so gaps → repair loop → GateError is\nunexercised. (3) the invalid-after-repair demotion (526-533) — no test drives validateTicket to fail twice,\nso the demotedIds \"move to Later\" path (a finding losing its ticket) never runs. All three are fail-closed\ngate behaviors whose regression would silently pass bad tickets to execution.\n\nDesign (decided): add three roadmap.test.js integration tests via the fake seam — offline degradation,\nfailing-probe→GateError exit 2, and double-invalid→demotion. No src/ change.\n\nAcceptance criteria:\n- AC1: Offline + coldstart-absent → gaps validated via static-lint, degradation declared — verified by: new test.\n- AC2: Native probe pass:false → repair loop runs, then GateError with exit-2 semantics — verified by: new test.\n- AC3: A ticket invalid after one repair round → demoted to Later, id in demotedIds — verified by: new test.\n- AC4: Full suite green.",
+      "scope": [
+        "test/roadmap.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 2,
+      "category": "test"
+    },
+    {
+      "id": "H15",
+      "title": "Extract a shared phase-runtime module; unify the three divergent JSON-salvage impls",
+      "body": "Motivation: [F-refactoring-phase-runtime] Five phase modules re-implement the same runtime helpers:\npatchPhase ×4 (comprehend:113, identify:131, rail:126, refresh:28), gateFail/makeGateError ×5 (comprehend:117,\nidentify:135, rail:118, roadmap:193, refresh:40), byte-identical jsonCall ×2 (comprehend:179, identify:221),\nloadRef/refText ×3 (identify:203, roadmap:176, rail:107), and the drainSpend-attach-to-err.state catch\npattern ×7. Drift is ACTIVE not hypothetical: coerceJson has already forked into two divergent copies\n(roadmap:180 throws OpError, refresh:48 returns null), and every gateFail copy misuses the\nGateError(gate, detail) constructor (utils.js:69) by passing a pre-formatted message as the gate arg,\nproducing garbled \"Gate failed: X — X\" messages — a live bug class the extraction eliminates.\n\nDesign (decided): extract patchPhase, makeGateError (using the constructor correctly), jsonCall, loadRef,\nand ONE canonical coerceJson (decide throw-vs-null; document) into src/utils.js (or a new src/phase-runtime.js);\nreplace the duplicated call sites. Zero behavior change EXCEPT the GateError message fix (call it out).\nScope is broad but mechanical; land after the other identify/refresh/roadmap tickets to avoid churn conflicts.\n\nAcceptance criteria:\n- AC1: One exported coerceJson/jsonCall/patchPhase/makeGateError; no duplicate local copies remain —\n  verified by: grep shows single definitions.\n- AC2: GateError messages are well-formed (\"Gate failed: <gate> — <detail>\", no doubled text) — verified by:\n  a test/utils.test.js assertion on a constructed gate failure message.\n- AC3: T0 rails + full suite byte-behavior green (except the corrected message) — verified by: node --test.\n\nDependencies: sequence after H6/H7/H9/H12/H14 (shared-file churn).",
+      "scope": [
+        "src/utils.js",
+        "src/comprehend.js",
+        "src/identify.js",
+        "src/rail.js",
+        "src/refresh.js",
+        "src/roadmap.js",
+        "src/scan.js",
+        "src/charter.js",
+        "test/utils.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 3,
+      "category": "refactoring"
+    },
+    {
+      "id": "H16",
+      "title": "Per-cell progress + running spend for the D1 comprehend and D2 identify phases",
+      "body": "Motivation: [F-dx-silent-phases] The two longest phases print nothing while working: identify.js\nrun() (750-1052) and finderCell (674-745) loop over dims×packets×passes×poolWidth LLM calls plus\nper-candidate verify with no log.phase/log.step (only warn/substep on suppress/kill), and comprehend.js\nrun() (347-533) is equally silent. Only charter.js (D0) and scan.js (D-1) — the two CHEAPEST phases — use\nlog.phase/log.step. On a real repo this is tens of minutes of dead console.\n\nDesign (decided): (a) log.phase(\"D2\",\"Identify\") / log.phase(\"D1\",\"Comprehend\") at run() entry;\n(b) a per-cell log.step in the D2 packet loop (identify.js:976-996), e.g.\n\"[security] packet 2/5 · pass N · 4 verified/7 killed · $1.83 spent\" — dims.length, packets.length, pi,\ncounts, and a running spend accessor are all in scope (add a lightweight llm.spentSoFar() or read the\naccumulator); (c) a per-packet / per-reader log.step in comprehend. Output only (no logic change); must be\ngated so --json does not pollute stdout (coordinate with H17 if landed).\n\nAcceptance criteria:\n- AC1: A D2 run emits at least one progress line per (dimension × packet) cell with dimension, packet index,\n  and running verified/killed counts — verified by: test/identify.test.js capturing a log spy.\n- AC2: D1 emits a progress line per reader/packet — verified by: comprehend log spy (or manual if no spy seam).\n- AC3: No change to findings/state/gates — verified by: existing identify/comprehend tests green.\n- AC4: Full suite green.",
+      "scope": [
+        "src/identify.js",
+        "src/comprehend.js",
+        "test/identify.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 1,
+      "category": "dx"
+    },
+    {
+      "id": "H17",
+      "title": "Machine-consumable --json: error envelopes, richer success payload, stdout hygiene",
+      "body": "Motivation: [F-dx-json-incomplete] Three CI gaps: (1) the JSON envelope is emitted only on success\n(bin/cli.js:198-200); the outer catch (224-233) prints human text to stderr — a CI wrapper gets no\n{ok:false, gate, detail} for GateError/OpError/BudgetError, forcing exit-code-only integration. (2) the\nsuccess envelope is just {command, ok, paused, summary} — no spend (state.budget.spentUSD), verified/killed\ncounts, gate name, or artifact paths, all sitting in `state`. (3) phase modules write decorative output to\nstdout unconditionally (log.phase/step/success/substep → console.log), so with --json, stdout mixes\nhuman lines with the JSON object and is not parseable.\n\nDesign (decided): (1) in the outer catch, when flags.json, print a JSON error envelope\n{ok:false, command, error:{kind, gate?, detail}} to stdout and exit with the right code. (2) enrich the\nsuccess envelope with spend + counts + gate + artifact paths from state. (3) when flags.json, route\nlog.phase/step/substep/success to stderr (or suppress) so stdout carries ONLY the final JSON.\n\nAcceptance criteria:\n- AC1: A GateError under --json prints a parseable {ok:false,...} on stdout with exit 2 — verified by:\n  test/cli.test.js spawn asserting JSON.parse(stdout).ok === false and exit code.\n- AC2: A successful --json run's envelope includes spend and verified/killed counts — verified by: spawn test.\n- AC3: Under --json, stdout is a single JSON object (no interleaved human lines) — verified by: spawn test\n  asserting JSON.parse(stdout) succeeds on the whole stream.\n- AC4: Non-json output unchanged — verified by: existing cli tests green.\n- AC5: Full suite green.\n\nDependencies: coordinate with H16 (both touch phase logging / stdout routing).",
+      "scope": [
+        "bin/cli.js",
+        "src/utils.js",
+        "test/cli.test.js"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 2,
+      "category": "dx"
+    },
+    {
+      "id": "H18",
+      "title": "Fix docs drift: README/SPEC/SKILL vs shipped behavior",
+      "body": "Motivation: [F-dx-docs-drift] Confirmed drift: (1) README's env-var table (159-167) omits\nDOBETTER_LOCAL_BASE_URL / DOBETTER_LOCAL_MODEL / DOBETTER_LOCAL_API_KEY (and DOBETTER_FAKE_LLM), all in\nHELP_TEXT (utils.js:236-245) and required for the --provider local path the README's own install section\nadvertises. (2) README's D2 sizing table row for N (line 151) still says \"a variable here; charter-weighted\npooling lands in T2\" — T2 shipped (charterPoolWidth, identify.js:121) and is described 40 lines earlier in\nthe same README, so the doc contradicts itself. (3) SPEC.md §4 (line 109) lists\n--provider anthropic|gemini|openai and omits `local`, which is implemented and documented elsewhere.\n\nDesign (decided): (1) add the DOBETTER_LOCAL_* rows to the README env-var table (DOBETTER_FAKE_LLM optional,\nmark as test seam). (2) update README line 151 to state pooling is shipped (present tense), consistent with\nlines 105-117. (3) add `local` to SPEC.md §4's provider list. Docs-only.\n\nAcceptance criteria:\n- AC1: README env-var table lists DOBETTER_LOCAL_BASE_URL/MODEL/API_KEY — verified by: grep in README.md.\n- AC2: README no longer says pooling \"lands in T2\" in future tense — verified by: grep returns no\n  \"lands in T2\".\n- AC3: SPEC.md §4 provider list includes local — verified by: grep in SPEC.md.\n- AC4: No code/test change; full suite green.",
+      "scope": [
+        "README.md",
+        "SPEC.md",
+        "do-better/SKILL.md"
+      ],
+      "rails": [
+        "test/identify-rails.test.js"
+      ],
+      "edges": [],
+      "duration": 1,
+      "category": "dx"
     }
   ]
 }
