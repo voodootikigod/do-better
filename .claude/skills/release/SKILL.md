@@ -12,9 +12,13 @@ metadata:
 Use this command to release a new version of `do-better` to npm.
 
 Publishing itself is automated: pushing a `vX.Y.Z` tag triggers
-`.github/workflows/publish.yml`, which verifies the tag matches
-`package.json`, runs tests, and publishes with provenance using the
-`NPM_TOKEN` repo secret. This command's job is to bump, tag, and push
+`.github/workflows/publish.yml`, which verifies the tag is an ancestor of
+`main` and matches `package.json`, runs tests, and publishes with
+`--provenance --access public` via npm's OIDC trusted publishing (falling
+back to the `NPM_TOKEN` environment secret only if trusted publishing isn't
+configured yet — see `docs/github-rulesets/README.md`). The publish job runs
+under the `npm-publish` protected environment, which requires a reviewer to
+approve it before it runs. This command's job is to bump, tag, and push
 correctly.
 
 ## Arguments
@@ -30,16 +34,20 @@ correctly.
    - On the `main` branch (`git branch --show-current`)
    - Up to date with remote (`git fetch` then confirm no divergence)
    - Tests pass (`npm test`)
-   - `NPM_TOKEN` is configured in the repo's Actions secrets (`gh secret list`) — the publish will fail without it
 
-3. **Bump the version:** update the `"version"` field in `package.json`.
+3. **Bump the version:**
+   ```bash
+   npm version <patch|minor|major> --no-git-tag-version
+   ```
+   This atomically updates the `"version"` field in both `package.json` and `package-lock.json`.
 
 4. **Commit the bump:**
    ```bash
-   git commit -am "chore: bump version to X.Y.Z"
+   git add package.json package-lock.json
+   git commit -m "chore: bump version to X.Y.Z"
    ```
 
-5. **Create the tag:** `vX.Y.Z` (must match `package.json` exactly — the workflow enforces this).
+5. **Create the tag:** `vX.Y.Z` (must match `package.json` exactly — the workflow enforces this). Tag creation is restricted by the `release tags` GitHub ruleset to admins — this push succeeds for a maintainer and is refused for anyone else.
 
 6. **Push commit and tag:**
    ```bash
@@ -50,4 +58,5 @@ correctly.
 7. **Confirm completion.** Print:
    - Previous version → new version
    - Tag created
-   - A reminder that the GitHub Actions publish workflow (`.github/workflows/publish.yml`, triggered on `v*` tags) will publish to npmjs automatically. Point the user at the Actions tab to watch it.
+   - A reminder that the tag push triggers `.github/workflows/publish.yml`, but the job waits under the `npm-publish` protected environment for a reviewer to approve it — point the user at the repo's Actions tab.
+   - If the publish job fails with `ENEEDAUTH`, npm trusted publishing isn't configured yet for `do-better` on npmjs.com — see `docs/github-rulesets/README.md` § "npm trusted publishing (OIDC)".
